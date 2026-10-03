@@ -106,7 +106,8 @@ export class RecordedMatch extends Match {
     for(const field of this.fields)this._recordField(field,resultOf(field));
     return super._finishFinal(hidden,resultOf);
   }
-  pump(until=this._wallNow(),limit=100) {
+  // `limit` must cover one platform alarm window: at a 5s grid the 1/30s pacing callbacks alone can be ~150.
+  pump(until=this._wallNow(),limit=512) {
     let n=0;
     while(n<limit && !this.disposed) {
       const at=this.sched.nextAt();

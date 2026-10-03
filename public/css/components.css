@@ -941,3 +941,13 @@
   --bk-c: var(--red-premium);
 }
 .crash__box h2 { font-size: .3rem; }
+
+/* Self-hosted sign-in (public/js/ui/localAuth.js). Sits inside .title-login on the title screen and
+   inside the in-game account menu, so it stays one column and inherits the field styles. */
+.local-auth { display: flex; flex-direction: column; gap: .12rem; width: 100%; }
+.local-auth__notice { margin: .06rem 0 0; font-size: .14rem; line-height: 1.5; color: var(--text-dim); }
+.local-auth__row { display: flex; flex-direction: column; gap: .08rem; margin-top: .12rem; }
+.local-auth--compact { gap: .06rem; }
+.local-auth--compact .local-auth__row { flex-direction: row; }
+.local-auth--compact .local-auth__row > * { flex: 1 1 0; }
+.local-auth input[type=password] { -webkit-text-security: disc; }

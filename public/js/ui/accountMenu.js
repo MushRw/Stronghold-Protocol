@@ -1,6 +1,7 @@
 import { useEffect,useState } from '../../vendor/hooks.module.js';
 import { html,Button,Panel,MicroLabel,DifficultyTag } from './components.js';
 import { account,accountRequest } from '../account.js';
+import { AccountSignIn } from './localAuth.js';
 import { net,identity } from '../net.js';
 import { store } from '../store.js';
 import { toast } from './toasts.js';
@@ -44,7 +45,7 @@ export function AccountMenu() {
       <${Button} variant="secondary" size="sm" icon="book" onClick=${()=>store.patch('ui',{accountPage:'history'})}>对局记录<//>
       <${Button} variant="secondary" size="sm" icon="signal" onClick=${()=>store.patch('ui',{accountPage:'statistics'})}>个人统计<//>
       <${LogoutButton} />
-    ` : html`<${Button} size="sm" disabled=${!account.loginReady} onClick=${()=>location.assign('/api/auth/github/start')}>${account.loginReady?'GitHub 登录':'登录尚未配置'}<//>`}
+    ` : html`<${AccountSignIn} compact=${true} />`}
   </div>`;
 }
 export function PublicRooms() {

@@ -524,6 +524,27 @@ export class Match {
     else if (phase === PHASE.PREP) this.maybeEndPrep();
   }
 
+  /**
+   * Drive a virtual scheduler: run every timer due at or before `until`, then bring the clock up to it.
+   * Alarm-driven platforms (Durable Objects) must hold no live JS timer, so their match is advanced by
+   * pumping instead: a pump of a whole alarm window replays the same 1/30 s callbacks in order, each one
+   * seeing the same dt it would have seen in real time, so the pacing is unchanged. Real and instant
+   * schedulers run themselves; returns 0.
+   */
+  pump(until = this.sched.now(), limit = 512) {
+    if (!this.sched.virtual || this.sched.instant) return 0;
+    let n = 0;
+    while (n < limit) {
+      const at = this.sched.nextAt?.();
+      if (at == null || at > until) break;
+      if (!this.sched.runNext?.()) break;
+      n++;
+    }
+    const now = this.sched.now();
+    if (now < until) this.sched.advance?.(until - now);
+    return n;
+  }
+
   dispose() {
     if (this.disposed) return;
     this.disposed = true;

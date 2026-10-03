@@ -1,5 +1,22 @@
 import { DurableObject } from 'cloudflare:workers';
-import { AccountError, pageLimit } from '../../shared/account-protocol.js';
+import { AccountError, pageLimit, requireLogin, requirePassword, requireReview, LOCAL_AUTH } from '../../shared/account-protocol.js';
+
+const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+const unhex = (value) => new Uint8Array((value || '').match(/../g)?.map((h) => parseInt(h, 16)) || []);
+const ACCOUNT_PAGE = 100;
+/** PBKDF2-HMAC-SHA256 in WebCrypto: native, so a 210k-round verifier costs the free plan no JS CPU. */
+async function deriveVerifier(password, salt) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: LOCAL_AUTH.iterations }, key, 256));
+}
+/** Length-independent comparison; a wrong guess must not leak how much of the verifier matched. */
+function equalBytes(a, b) {
+  if (a.length !== b.length || !a.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
 
 /** Small site-wide identity/session index; no game events or battle frames. */
 export class SiteDirectory extends DurableObject {
@@ -11,6 +28,10 @@ export class SiteDirectory extends DurableObject {
     this.sql.exec('CREATE INDEX IF NOT EXISTS auth_expiry ON auth_records(expires_at)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS rooms (room_id TEXT PRIMARY KEY, value TEXT NOT NULL, visible INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS archives (match_id TEXT PRIMARY KEY)');
+    // Self-hosted accounts. The login is the primary key (case-insensitive), and the profile also
+    // lands in `users` under a synthetic id so backup/restore keeps working without knowing the provider.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS local_auth (login TEXT PRIMARY KEY COLLATE NOCASE, account_id TEXT NOT NULL UNIQUE, salt TEXT NOT NULL, verifier TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, reviewed_at INTEGER)");
+    this.sql.exec('CREATE INDEX IF NOT EXISTS local_auth_status ON local_auth(status,created_at)');
   }
   resolveGithubUser({id, login, name, avatarUrl}) {
     if (!/^\d{1,20}$/.test(id) || typeof login !== 'string' || login.length > 80) throw new AccountError('INVALID_PROFILE');
@@ -22,6 +43,56 @@ export class SiteDirectory extends DurableObject {
         id, profile.accountId, JSON.stringify(profile));
       return profile;
     });
+  }
+  /** Register a self-hosted account. It stays `pending` until an operator approves it. */
+  async createLocalUser({ login, password, now = Date.now() }) {
+    requireLogin(login); requirePassword(password);
+    // Derived before the sync transaction: WebCrypto is async and this object is single-threaded.
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const verifier = await deriveVerifier(password, salt);
+    return this.ctx.storage.transactionSync(() => {
+      if (this.sql.exec('SELECT account_id FROM local_auth WHERE login=?', login).toArray()[0]) {
+        throw new AccountError('LOGIN_TAKEN', 409);
+      }
+      const accountId = crypto.randomUUID();
+      const profile = { accountId, githubId: 'local:' + accountId, githubLogin: '', name: login, avatarUrl: null, local: true };
+      this.sql.exec('INSERT INTO users VALUES (?,?,?)', profile.githubId, accountId, JSON.stringify(profile));
+      this.sql.exec('INSERT INTO local_auth VALUES (?,?,?,?,?,?,?)', login, accountId, hex(salt), hex(verifier), 'pending', now, null);
+      return { ...profile, status: 'pending', createdAt: now };
+    });
+  }
+  /** Verify a login/password. An unknown login still pays the PBKDF2 cost, so timing leaks nothing. */
+  async verifyLocalUser({ login, password }) {
+    const row = this.sql.exec('SELECT account_id,salt,verifier,status FROM local_auth WHERE login=?', login).toArray()[0];
+    if (!row) { await deriveVerifier(String(password || ''), new Uint8Array(16)); return null; }
+    const candidate = await deriveVerifier(String(password || ''), unhex(row.salt));
+    if (!equalBytes(candidate, unhex(row.verifier))) return null;
+    const stored = this.sql.exec('SELECT profile FROM users WHERE account_id=?', row.account_id).toArray()[0];
+    if (!stored) return null;
+    return { ...JSON.parse(stored.profile), status: row.status };
+  }
+  /** null for accounts that did not come from the self-hosted provider (they need no review). */
+  localStatusByAccount(accountId) {
+    return this.sql.exec('SELECT status FROM local_auth WHERE account_id=?', accountId).toArray()[0]?.status || null;
+  }
+  reviewLocalUser({ login, status, now = Date.now() }) {
+    requireReview(status);
+    return this.ctx.storage.transactionSync(() => {
+      const row = this.sql.exec('SELECT account_id FROM local_auth WHERE login=?', login).toArray()[0];
+      if (!row) throw new AccountError('UNKNOWN_LOGIN', 404);
+      this.sql.exec('UPDATE local_auth SET status=?, reviewed_at=? WHERE login=?', status, now, login);
+      // A rejected account must not keep playing on the session it already holds.
+      if (status !== 'approved') {
+        this.sql.exec("DELETE FROM auth_records WHERE kind='session' AND json_extract(value,'$.accountId')=?", row.account_id);
+      }
+      return { login, status, accountId: row.account_id, reviewedAt: now };
+    });
+  }
+  listLocalUsers({ status = '', limit = ACCOUNT_PAGE } = {}) {
+    if (status) requireReview(status);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > ACCOUNT_PAGE) throw new AccountError('INVALID_PAGE');
+    return this.sql.exec('SELECT login,status,created_at,reviewed_at FROM local_auth WHERE (?=\'\' OR status=?) ORDER BY created_at LIMIT ?',
+      status, status, limit).toArray().map((r) => ({ login: r.login, status: r.status, createdAt: r.created_at, reviewedAt: r.reviewed_at }));
   }
   async saveOAuth(key, value) { return this.saveRecord('oauth', key, value); }
   async saveSession(key, value) { return this.saveRecord('session', key, value); }

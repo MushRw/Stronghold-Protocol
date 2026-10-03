@@ -4,7 +4,9 @@ import { CODE_ALPHABET } from '../server/lobby.js';
 import { normalizeIp, limitKeyOf, TokenBucket } from '../server/net.js';
 import { RoomRuntime, validCode } from './room-runtime.js';
 import { PACK_PATH, servePack } from './pack.js';
-import { handleAuth, authenticate, accountOf, directoryOf } from './accounts/auth.js';
+import { handleAuth, approvedSession, accountOf, directoryOf } from './accounts/auth.js';
+import { handleAdminRoutes, adminConfigured } from './accounts/admin.js';
+import { ADMIN_PAGE, adminPageHeaders } from './accounts/admin-page.js';
 import { handleAccountRoutes } from './accounts/routes.js';
 import { handleLobbyRoutes, roomApplications } from './rooms/routes.js';
 import { handleHistoryRoutes } from './archive/routes.js';
@@ -17,6 +19,10 @@ const json = (body, status = 200, headers = {}) => Response.json(body, { status,
   headers: { 'Cache-Control': 'no-store', ...headers } });
 const error = (status, code, detail) => json({ error: code, ...(detail ? { detail } : {}) }, status);
 const edgeIp = (request) => normalizeIp(request.headers.get('CF-Connecting-IP')) || '0.0.0.0';
+// Free-tier budget guards. A Durable Object is only billed for duration while it is awake, and an
+// active JS timer would keep it awake (billable wall-clock) for the whole match, so a match in
+// progress is pumped by alarms and its checkpoint is only flushed every MATCH_PERSIST_MS.
+const MATCH_PERSIST_MS = 10_000;
 const roomStub = (env, code) => env.ROOMS.get(env.ROOMS.idFromName(code), { locationHint: 'apac' });
 const sameOrigin = (request) => !request.headers.has('Origin') || request.headers.get('Origin') === new URL(request.url).origin;
 async function admit(env, ip, kind) {
@@ -30,10 +36,15 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const backup=await handleBackupRoutes(request,env);if(backup)return backup;
-    if(env.ADMISSION && (path==='/api/auth/github/start' || path==='/api/rooms' && request.method==='GET' || /\/applications$/.test(path))) {
-      const limited=await admit(env,edgeIp(request),path.startsWith('/api/auth/')?'auth':request.method==='GET'?'status':'application');
+    if (path === '/admin') return adminConfigured(env) ? new Response(ADMIN_PAGE, adminPageHeaders()) : error(404, 'NOT_FOUND');
+    if(env.ADMISSION && (path.startsWith('/api/auth/') || path==='/api/rooms' && request.method==='GET' || /\/applications$/.test(path))) {
+      const kind=path.startsWith('/api/auth/local')||path==='/api/auth/register'||path==='/api/auth/login'?'localauth'
+        :path.startsWith('/api/auth/')?'auth':request.method==='GET'?'status':'application';
+      const limited=await admit(env,edgeIp(request),kind);
       if(limited)return limited;
     }
+    const admin = await handleAdminRoutes(request, env);
+    if (admin) return admin;
     const auth = await handleAuth(request, env);
     if (auth) return auth;
     const accountResponse = await handleAccountRoutes(request, env);
@@ -49,8 +60,10 @@ export default {
     if (path === '/api/rooms') {
       if (request.method !== 'POST') return error(405, 'BAD_MSG');
       if (!sameOrigin(request)) return error(403, 'BAD_MSG', 'origin mismatch');
-      const session = env.ACCOUNTS ? await authenticate(request, env) : null;
-      if (env.ACCOUNTS && !session) return error(401, 'LOGIN_REQUIRED');
+      // Playing starts here: a reviewed account is required, not merely a valid session.
+      const gate = env.ACCOUNTS ? await approvedSession(request, env) : { session: null };
+      if (gate.error) return error(gate.error.status, gate.error.code);
+      const session = gate.session;
       if (session && request.headers.get('Origin') !== url.origin) return error(403, 'BAD_MSG');
       if (session && await accountOf(env, session.accountId).getActiveSeat()) return error(409, 'ALREADY_SEATED');
       const limited = await admit(env, edgeIp(request), 'reserve');
@@ -87,8 +100,10 @@ export default {
       if (!validCode(code)) return error(400, 'BAD_MSG', 'invalid room code');
       if (!sameOrigin(request)) return error(403, 'BAD_MSG', 'origin mismatch');
       const ip = edgeIp(request);
-      const session = env.ACCOUNTS ? await authenticate(request,env) : null;
-      if (env.ACCOUNTS && !session) return error(401,'LOGIN_REQUIRED');
+      // A room ticket alone must not let an unreviewed account connect.
+      const gate = env.ACCOUNTS ? await approvedSession(request, env) : { session: null };
+      if (gate.error) return error(gate.error.status, gate.error.code);
+      const session = gate.session;
       const limited = await admit(env, ip, 'connect');
       if (limited) return limited;
       const dest = new URL('https://room.internal/_ws');
@@ -110,7 +125,7 @@ export class AdmissionDurableObject {
   async fetch(request) {
     return this.ctx.blockConcurrencyWhile(async () => {
       const kind = new URL(request.url).pathname.slice(1);
-      const settings = { reserve: [8 / 60, 8], connect: [40 / 60, 20], status: [120 / 60, 30],auth:[10/60,5],application:[30/60,10] }[kind];
+      const settings = { reserve: [8 / 60, 8], connect: [40 / 60, 20], status: [120 / 60, 30],auth:[10/60,5],localauth:[20/60,10],application:[30/60,10] }[kind];
       if (request.method !== 'POST' || !settings) return error(404, 'BAD_MSG');
       const now = Date.now();
       const stored = await this.ctx.storage.get(kind);
@@ -151,7 +166,7 @@ export class RoomDurableObject {
     this.ctx = ctx;
     this.env = env;
     this.sockets = new Map();
-    this.activeTimer = null;
+    this.lastPersistAt = 0;
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping","c":0}', '{"t":"pong","c":0}'));
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const meta = await ctx.storage.get('snapshot-meta');
@@ -174,6 +189,7 @@ export class RoomDurableObject {
         if(c.events.length!==c.eventCount) throw new Error('INCOMPLETE_MATCH_LOG');
         this.persistedLogId=c.eventLogId;this.persistedEventCount=c.events.length;
       }
+
       this.parts = meta?.parts || 0;
       this.runtime = new RoomRuntime({ snapshot, accounts: !!env.ACCOUNTS, onChange: () => this.queuePersist() });
       for (const ws of ctx.getWebSockets()) {
@@ -205,19 +221,23 @@ export class RoomDurableObject {
   }
   queuePersist() {
     // Match completion can be initiated by one of its existing timers, outside a WebSocket event.
-    this.ctx.waitUntil(this.ctx.blockConcurrencyWhile(() => this.persist()));
+    // Forced so the "match over" transition is durable on the next tick, never up to 10s later.
+    this.ctx.waitUntil(this.ctx.blockConcurrencyWhile(() => this.persistNow()));
+  }
+  /**
+   * Write durable state now, skipping the MATCH_PERSIST_MS throttle. The flag lives on the instance
+   * rather than in an argument so that every write still goes through persist() — a subclass (or a
+   * test) overriding persist() must never be able to swallow the request by dropping a parameter.
+   */
+  async persistNow() {
+    this.persistForced = true;
+    try { return await this.persist(); } finally { this.persistForced = false; }
   }
   async persist() {
     const rt = this.runtime;
     const active = !!rt.status()?.inMatch;
-    if (active && !this.activeTimer) {
-      // An untimed solo phase still owns live match memory. Explicitly prevent hibernation until it ends.
-      this.activeTimer = setInterval(() => {
-        this.ctx.waitUntil(this.ctx.blockConcurrencyWhile(async () => {
-          this.refreshAutoResponses(); rt.pump(); rt.sweep(); await this.persist();
-        }));
-      }, this.env.ACCOUNTS ? 100 : 30_000);
-    } else if (!active && this.activeTimer) { clearInterval(this.activeTimer); this.activeTimer = null; }
+    const force = this.persistForced === true;
+    const now = Date.now();
     for (const [ws, adapter] of this.sockets) {
       const attachment = rt.attachment(adapter);
       if (attachment) ws.serializeAttachment(attachment);
@@ -231,6 +251,13 @@ export class RoomDurableObject {
       for(const adapter of this.sockets.values())adapter.flush();
       return;
     }
+    // A throttled flush must still drain buffered socket writes, or clients would stall for 10s.
+    if (active && !force && now - this.lastPersistAt < MATCH_PERSIST_MS) {
+      for (const adapter of this.sockets.values()) adapter.flush();
+      await this.scheduleAlarm();
+      return;
+    }
+    this.lastPersistAt = now;
     // KV values have a size limit. Chunk by UTF-16 characters so even non-ASCII names stay below it.
     const snapshot=rt.snapshot(), checkpoint=snapshot.matchCheckpoint;
     let newEvents=[], logId=null;
@@ -255,6 +282,7 @@ export class RoomDurableObject {
         for(let offset=0;offset<oldKeys.length;offset+=128)await txn.delete(oldKeys.slice(offset,offset+128));
       }
     });
+
     this.parts = count;
     if(checkpoint) {this.persistedLogId=logId;this.persistedEventCount=checkpoint.eventCount;}
     for(const adapter of this.sockets.values()) adapter.flush();
@@ -301,7 +329,11 @@ export class RoomDurableObject {
         }
       }
     }
-    const at = rt.nextAlarm();
+    await this.scheduleAlarm();
+  }
+  async scheduleAlarm() {
+    // Always re-arm from the next alarm(): a throttled persist() must not leave the object unscheduled.
+    const at = this.runtime.nextAlarm();
     if (at) await this.ctx.storage.setAlarm(at);
     else await this.ctx.storage.deleteAlarm();
   }
@@ -313,20 +345,20 @@ export class RoomDurableObject {
       this.refreshAutoResponses();
       rt.sweep();
       if(this.env.ACCOUNTS && ['/_applications','/_visibility'].includes(url.pathname)) {
-        const response=await roomApplications(rt,request,this.env);await this.persist();return response;
+        const response=await roomApplications(rt,request,this.env);await this.persistNow();return response;
       }
       if (url.pathname === '/_reserve' && request.method === 'POST') {
         const code = url.searchParams.get('room');
         if (!validCode(code)) return error(400, 'BAD_MSG');
         const ticket = rt.reserve(code, request.headers.get('X-Account-ID'));
-        await this.persist();
+        await this.persistNow();
         return ticket ? json({ code, ticket, ...(rt.accounts ? {generation:rt.generation} : {}) }, 201) : error(409, 'ROOM_FULL');
       }
       if (url.pathname === '/_account') {
         const accountId=request.headers.get('X-Account-ID');
         if (request.headers.get('X-Room-Generation')!==rt.generation || !rt.hasAccount(accountId)) return error(404,'ROOM_NOT_FOUND');
         if (request.method==='POST') {
-          const ticket=rt.resumeAccount(accountId); await this.persist();
+          const ticket=rt.resumeAccount(accountId); await this.persistNow();
           return ticket ? json({code:rt.code,ticket,join:rt.applications.list(accountId).some(x=>x.status==='approved'),reserved:rt.reservation?.accountId===accountId}) : error(404,'ROOM_NOT_FOUND');
         }
         return json({activeSeat:{roomId:rt.code,roomGeneration:rt.generation},status:rt.status()});
@@ -348,7 +380,7 @@ export class RoomDurableObject {
       this.sockets.set(server, adapter);
       rt.connect(adapter, { ip, ticket: url.searchParams.get('ticket'), accountId: request.headers.get('X-Account-ID'),
         sessionId:request.headers.get('X-Session-ID') });
-      await this.persist();
+      await this.persistNow();
       return new Response(null, { status: 101, webSocket: client });
     });
   }
@@ -362,7 +394,7 @@ export class RoomDurableObject {
     return this.ctx.blockConcurrencyWhile(async () => {
       const adapter = this.sockets.get(ws);
       if (adapter) this.runtime.message(adapter, message);
-      await this.persist();
+      await this.persistNow();
     });
   }
   async webSocketClose(ws, code, reason) {
@@ -371,7 +403,7 @@ export class RoomDurableObject {
       const adapter = this.sockets.get(ws);
       if (adapter) { this.runtime.disconnect(adapter); this.sockets.delete(ws); }
       try { ws.close(code === 1005 ? 1000 : code, reason); } catch {}
-      await this.persist();
+      await this.persistNow();
     });
   }
   async webSocketError(ws) { return this.webSocketClose(ws, 1011, 'socket error'); }
@@ -382,6 +414,8 @@ export class RoomDurableObject {
       this.runtime.pump();
       this.runtime.sweep();
       await this.persist();
+      // Re-arm unconditionally: the match clock lives in alarms, not in an in-memory timer.
+      await this.scheduleAlarm();
     });
   }
 }

@@ -9,7 +9,11 @@
   "preview_urls": false,
   "vars": {
     "AUTH_ORIGIN": "https://stronghold.lunar.ag",
-    "GITHUB_CLIENT_ID": "Ov23liVRPUgvbQPtKkoo"
+    "GITHUB_CLIENT_ID": "Ov23liVRPUgvbQPtKkoo",
+    // Self-hosted accounts: a callsign + password that an operator reviews by hand at /admin.
+    // Set to "0" to keep GitHub as the only way in. ADMIN_TOKEN (>= 32 chars) is a *secret*:
+    //   npx wrangler secret put ADMIN_TOKEN
+    "LOCAL_AUTH": "1"
   },
   // Allow Workers Builds previews; no preview-specific room bindings are configured.
   "previews": {},

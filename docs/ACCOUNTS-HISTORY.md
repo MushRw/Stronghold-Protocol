@@ -14,6 +14,23 @@
 
 账号偏好不包含在下述历史/回放导出工具中；它使用 Account DO 的持久存储和 PITR。
 
+## 自建账号（口令登录 + 人工审核）
+
+不想依赖 GitHub 时，可以用自建账号：玩家自己设代号和密码，**必须经管理员审核批准才能玩**。绑定 `ACCOUNTS` 的部署默认开启，设置 `"LOCAL_AUTH": "0"` 可关闭（关闭后只剩 GitHub 登录）。
+
+- 入口：标题页的「代号 + 密码」表单，登录与注册在同一处切换；`GET /api/me` 的 `capabilities.localAuth` 为真时前端显示该表单而不是 GitHub 按钮。
+- 接口：`POST /api/auth/register`（代号、密码）只创建 `pending` 账号并返回提示，**不下发会话**；`POST /api/auth/login` 校验口令，密码错误一律 401（不区分"不存在"与"密码错"），未审核返回 403 `NOT_APPROVED`。
+- 口令只存 PBKDF2-HMAC-SHA256 散列（210000 轮，16 字节随机盐，走 WebCrypto，不计入免费层 JS CPU）；站点不保存、也无法找回明文。
+- 审核闸门在 `approvedSession()`：`POST /api/rooms`（拿房间票）与 `GET /ws` 都要"已登录 + 已批准"。被拒绝的账号会当场删除已有会话，不能继续用旧 cookie 上线。
+- 限流：注册与登录走独立的 `localauth` 桶（每分钟 20 次、突发 10），比 GitHub 跳转宽松，但仍限制 PBKDF2 的计算量。
+- 外部登录（GitHub）创建的账号没有审核状态，直接视为已批准，两者可以共存。
+
+### 审核后台
+
+1. 用 `npx wrangler secret put ADMIN_TOKEN` 写入管理令牌（至少 32 字符），否则 `/admin` 与 `/api/admin/*` 一律 404。
+2. 打开 `https://你的域名/admin`，填入同一个令牌，即可看到待审核列表并批准或拒绝。令牌只存在浏览器 sessionStorage，页面不会回显，也拿不到任何密码。
+3. 接口：`GET /api/admin/accounts?status=pending|approved|rejected|`（令牌放 `X-Admin-Token` 头或 `?token=`）、`POST /api/admin/review` `{login, status}`。令牌用 SHA-256 归一化后逐字节比较。
+
 ## 配置与首次发布
 
 1. 先让现有匿名对局结束。旧匿名会话不能自动归属 GitHub 账号，旧版内存对局不能迁移成持久对局。

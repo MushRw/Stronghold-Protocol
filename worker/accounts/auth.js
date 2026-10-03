@@ -1,4 +1,4 @@
-import { ACCOUNT_LIMITS, AccountError } from '../../shared/account-protocol.js';
+import { ACCOUNT_LIMITS, AccountError, requireLogin, requirePassword } from '../../shared/account-protocol.js';
 const SESSION_COOKIE = '__Host-sp_session', OAUTH_COOKIE = '__Host-sp_oauth';
 export const directoryOf = env => env.SITES.get(env.SITES.idFromName('directory'));
 export const accountOf = (env, id) => env.ACCOUNTS.get(env.ACCOUNTS.idFromName(id));
@@ -15,12 +15,51 @@ export function requireOrigin(request) {
   if (request.headers.get('Origin') !== new URL(request.url).origin) throw new AccountError('ORIGIN_MISMATCH', 403);
 }
 export function configured(env) { return !!(env.SITES && env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET && env.AUTH_ORIGIN); }
+/** Self-hosted accounts need no third-party app: a login, a password and an operator's approval. */
+export function localConfigured(env) { return !!(env.SITES && env.ACCOUNTS && env.LOCAL_AUTH !== '0'); }
 export async function authenticate(request, env, {now = Date.now} = {}) {
   const token = cookieValue(request, SESSION_COOKIE);
   if (!env.SITES || !token || !/^[a-f0-9]{64}$/.test(token)) return null;
   const sessionId = await hash(token);
   const session = await directoryOf(env).getSession(sessionId);
   return session && session.expiresAt > now() ? {...session, sessionId} : null;
+}
+/**
+ * The gate for everything that counts as playing: a valid session *and* a reviewed account. A pending
+ * or rejected self-hosted account may still log in, so the UI can explain the wait, but it gets no room
+ * ticket and therefore no WebSocket. Accounts from an external provider carry no review state.
+ */
+export async function approvedSession(request, env) {
+  const session = await authenticate(request, env);
+  if (!session || !env.ACCOUNTS) return { error: { code: 'LOGIN_REQUIRED', status: 401 } };
+  if (localConfigured(env)) {
+    const status = await directoryOf(env).localStatusByAccount(session.accountId);
+    if (status && status !== 'approved') return { error: { code: 'NOT_APPROVED', status: 403 } };
+  }
+  return { session };
+}
+/** Bounded JSON body reader: a login form must not be able to stream an unbounded payload. */
+async function readJson(request, maxBytes = 1024) {
+  const reader = request.body?.getReader();
+  if (!reader) throw new AccountError('INVALID_BODY');
+  const chunks = []; let size = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) { await reader.cancel(); throw new AccountError('BODY_TOO_LARGE', 413); }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  let body;
+  try { body = JSON.parse(new TextDecoder().decode(bytes)); } catch { throw new AccountError('INVALID_BODY'); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some((k) => !['login', 'password'].includes(k))) throw new AccountError('INVALID_BODY');
+  return body;
 }
 // Accounts created before display names were stored can keep their existing session.
 // Only legacy profiles need this lookup; an upstream outage must not break /api/me.
@@ -48,13 +87,12 @@ export async function handleAuth(request, env, {now = Date.now, fetch: providerF
       const session = await authenticate(request, env, {now});
       const storedUser = session ? (env.ACCOUNTS ? await accountOf(env, session.accountId).getProfile() : session.user) : null;
       const user = await refreshLegacyProfile(storedUser, env, providerFetch);
-      return json({user, capabilities: {accounts: configured(env),accountSystem:!!env.ACCOUNTS},
+      return json({user, capabilities: {accounts: configured(env),accountSystem:!!env.ACCOUNTS, localAuth:localConfigured(env)},
         application:session && env.ACCOUNTS ? await accountOf(env,session.accountId).getApplication() : null,
-        activeSeat: session && env.ACCOUNTS ? await accountOf(env, session.accountId).getActiveSeat() : null});
+        activeSeat: session && env.ACCOUNTS ? await accountOf(env,session.accountId).getActiveSeat() : null});
     }
-    if (!configured(env)) return json({error: 'AUTH_UNAVAILABLE'}, 503);
-    if (url.origin !== env.AUTH_ORIGIN) return json({error: 'INVALID_ORIGIN'}, 400);
     const directory = directoryOf(env);
+    // Provider-independent endpoints come first: a self-hosted deployment never configures GitHub at all.
     if (url.pathname === '/api/auth/logout') {
       if (request.method !== 'POST') return json({error: 'METHOD'}, 405);
       requireOrigin(request);
@@ -62,6 +100,32 @@ export async function handleAuth(request, env, {now = Date.now, fetch: providerF
       if (session) await directory.revokeSession(session.sessionId);
       return new Response(null, {status: 204, headers: {'Set-Cookie': cookie(SESSION_COOKIE, '', 0), 'Cache-Control': 'no-store'}});
     }
+    if (url.pathname === '/api/auth/register' || url.pathname === '/api/auth/login') {
+      if (!localConfigured(env)) return json({error: 'AUTH_UNAVAILABLE'}, 503);
+      if (request.method !== 'POST') return json({error: 'METHOD'}, 405);
+      // AUTH_ORIGIN pins the exact public origin when set; otherwise the same-origin check already applies.
+      if (env.AUTH_ORIGIN && url.origin !== env.AUTH_ORIGIN) return json({error: 'INVALID_ORIGIN'}, 400);
+      requireOrigin(request);
+      const body = await readJson(request);
+      const login = requireLogin(body.login), password = requirePassword(body.password);
+      if (url.pathname === '/api/auth/register') {
+        const user = await directory.createLocalUser({ login, password, now: now() });
+        if (env.ACCOUNTS) await accountOf(env, user.accountId).setProfile(user);
+        return json({ ok: true, status: 'pending', login: user.name }, 201);
+      }
+      const user = await directory.verifyLocalUser({ login, password });
+      if (!user) return json({ error: 'BAD_CREDENTIALS' }, 401);
+      if (user.status !== 'approved') return json({ error: 'NOT_APPROVED', status: user.status }, 403);
+      if (env.ACCOUNTS) await accountOf(env, user.accountId).setProfile(user);
+      const { status, createdAt, reviewedAt, ...profile } = user;
+      const sessionToken = randomToken();
+      await directory.saveSession(await hash(sessionToken), { accountId: profile.accountId, user: profile, expiresAt: now() + ACCOUNT_LIMITS.sessionMs });
+      const headers = new Headers({ 'Cache-Control': 'no-store' });
+      headers.append('Set-Cookie', cookie(SESSION_COOKIE, sessionToken, ACCOUNT_LIMITS.sessionMs / 1000));
+      return new Response(null, { status: 204, headers });
+    }
+    if (!configured(env)) return json({error: 'AUTH_UNAVAILABLE'}, 503);
+    if (url.origin !== env.AUTH_ORIGIN) return json({error: 'INVALID_ORIGIN'}, 400);
     if (request.method !== 'GET') return json({error: 'METHOD'}, 405);
     const callback = env.AUTH_ORIGIN + '/api/auth/github/callback';
     if (url.pathname === '/api/auth/github/start') {
@@ -106,6 +170,10 @@ export async function handleAuth(request, env, {now = Date.now, fetch: providerF
   } catch (e) {
     if(url.pathname==='/api/auth/github/callback' && request.headers.get('Accept')?.includes('text/html'))
       return new Response(null,{status:303,headers:{Location:'/?authError=1','Cache-Control':'no-store','Set-Cookie':cookie(OAUTH_COOKIE,'',0)}});
-    return json({error: e instanceof AccountError ? e.code : 'AUTH_FAILED'}, e instanceof AccountError ? e.status : 502);
+    // Duck-typed on purpose: an AccountError raised inside a Durable Object comes back over RPC
+    // without its prototype, so instanceof would report every cross-DO failure as a 502.
+    const code = typeof e?.code === 'string' ? e.code : 'AUTH_FAILED';
+    const status = Number.isInteger(e?.status) ? e.status : 502;
+    return json({error: code}, status);
   }
 }

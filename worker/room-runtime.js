@@ -1,6 +1,8 @@
 // Platform adapter only: the authoritative game rules remain in Lobby / Network / Match.
 import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
+import { Match } from '../server/match/Match.js';
+import { VirtualScheduler } from '../server/match/scheduler.js';
 import { Lobby, Room, CODE_ALPHABET } from '../server/lobby.js';
 import { Network, Session, SessionRegistry, sendSession, normalizeIp, limitKeyOf } from '../server/net.js';
 import { ERR } from '../shared/constants.js';
@@ -11,6 +13,23 @@ import { retainedMatchVersions } from './match-versions.js';
 export const ROOM_LIMITS = Object.freeze({ sockets: 16, socketsPerIp: 8, sessions: 32, messageBytes: 65_536,
   reservationMs: 120_000, idleSocketMs: 90_000 });
 export const validCode = (s) => typeof s === 'string' && s.length === 4 && [...s].every((c) => CODE_ALPHABET.includes(c));
+// Alarm cadence tuned for the Workers free plan. Duration is billed for every second the object stays
+// awake, so a match is advanced by a coarse alarm grid instead of an in-memory timer: a live timer
+// would keep the object awake (and billable) for the whole match. Every wake also spends a DO request,
+// so the grid stays coarse enough to leave the 100k requests/day budget for several rooms.
+export const ALARM = Object.freeze({ matchTickMs: 3_000, floorMs: 1_000, gridMs: 5_000 });
+
+/**
+ * A match whose timers live on a pumpable virtual clock. Alarm-driven platforms must hold no live JS
+ * timer (one keeps the Durable Object awake and billable for the whole match), so the object advances
+ * the match itself, once per alarm window: pump() replays the 1/30 s callbacks in order and each one
+ * sees the same dt it would have seen in real time, so pacing is unchanged.
+ */
+export class AlarmMatch extends Match {
+  constructor(opts) {
+    super({ ...opts, scheduler: new VirtualScheduler({ start: (opts.now || Date.now)(), instantCombat: false }) });
+  }
+}
 
 class RoomNetwork extends Network {
   onHelloMsg(conn, msg, now) {
@@ -78,8 +97,8 @@ export class RoomRuntime {
     this.interruptedUntil = snapshot?.interruptedUntil || 0;
     this.socketMeta = new Map();
     this.registry = new SessionRegistry({ now, maxSessions: ROOM_LIMITS.sessions });
-    this.lobby = new AlarmLobby({ registry: this.registry, now, options: { maxRooms: 1 },
-      ...(accounts ? {MatchClass:RecordedMatch} : {}) });
+    // Always alarm-driven: the platform listens to the room, so neither mode may run an in-memory timer.
+    this.lobby = new AlarmLobby({ registry: this.registry, now, options: { maxRooms: 1 }, MatchClass: accounts ? RecordedMatch : AlarmMatch });
     this.lobby.genCode = () => this.code;
     this.lobby.onChange = onChange;
     this.lobby.onArchive=(room,ctx,summary)=>{
@@ -323,13 +342,21 @@ export class RoomRuntime {
     const match=this.lobby.getRoom(this.code)?.match;
     if (match?.recording) {
       const next=match.sched.nextAt(); if(next!=null) deadlines.push(next);
+    } else if (match) {
+      // Battles resolve in the players' browsers; the server only owns bot battles and结算超时.
+      // A coarse tick is enough: it only has to keep the object able to pump before the next client move.
+      deadlines.push(this.now() + ALARM.matchTickMs);
     }
     if (this.reservation) deadlines.push(Math.max(this.now() + 30_000, this.reservation.expiresAt));
     if (this.interruptedUntil > this.now()) deadlines.push(this.interruptedUntil);
     for (const c of this.network.conns.values()) deadlines.push(c.session
       ? c.session.lastSeen + ROOM_LIMITS.idleSocketMs : c.openedAt + this.network.opts.helloTimeoutMs);
     for (const s of this.registry.all()) if (!s.connected) deadlines.push(s.disconnectedAt + this.registry.windowOf(s) + 1);
-    return deadlines.length ? Math.max(this.now() + 100, Math.min(...deadlines)) : null;
+    if (!deadlines.length) return null;
+    const now = this.now();
+    let at = Math.max(Math.min(...deadlines), now + ALARM.floorMs);
+    // Align to the grid so overlapping rooms wake in phase and each wake is followed by real sleep.
+    return Math.max(Math.ceil(at / ALARM.gridMs) * ALARM.gridMs, now + ALARM.floorMs);
   }
   snapshot() {
     const room = this.lobby.getRoom(this.code);

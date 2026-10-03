@@ -6,7 +6,7 @@ test('online room writes require cookie identity and ignore forged account heade
   const token='a'.repeat(64), sessionId=await hash(token), calls=[];
   const session={accountId:'alice',expiresAt:Date.now()+60000};
   const env={
-    SITES:{idFromName:n=>n,get:()=>({getSession:async key=>key===sessionId?session:null})},
+    SITES:{idFromName:n=>n,get:()=>({getSession:async key=>key===sessionId?session:null,localStatusByAccount:async()=>null})},
     ACCOUNTS:{idFromName:n=>n,get:()=>({getActiveSeat:async()=>null,claimSeat:async()=>({ok:true}),releaseSeat:async()=>({ok:true})})},
     ADMISSION:{idFromName:n=>n,get:()=>({fetch:async()=>new Response(null,{status:204})})},
     ROOMS:{idFromName:n=>n,get:()=>({fetch:async req=>{calls.push(req);

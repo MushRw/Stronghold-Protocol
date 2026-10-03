@@ -12,6 +12,7 @@ import { useMemo, useState } from '../../vendor/hooks.module.js';
 import { NAME_MAX_LEN, APP_VERSION } from '../../../shared/constants.js';
 import { html, Button, Icon, MicroLabel, TextField, PingPill, AvatarFrame } from '../ui/components.js';
 import { LogoutButton } from '../ui/accountMenu.js';
+import { AccountSignIn } from '../ui/localAuth.js';
 import { GuideButton } from '../ui/guide.js';
 import { toast } from '../ui/toasts.js';
 import { net, identity } from '../net.js';
@@ -262,9 +263,9 @@ export function TitleScreen() {
             <${LogoutButton} />
           </div>
           <${Button} class="title-login__enter" variant="primary" size="xl" block=${true} onClick=${enterAccount}>进入大厅<//>
-        ` : account.enabled ? html`<${Button} class="title-login__github" variant="primary" size="xl" block=${true} disabled=${!account.loginReady}
-          onClick=${()=>location.assign('/api/auth/github/start')}>${account.loginReady?'使用 GitHub 登录':'GitHub 登录尚未配置'}<//>
-          <${Button} variant="ghost" size="lg" block=${true} onClick=${()=>store.patch('session',{entered:true})}>浏览在线大厅<//>` : html`
+        ` : account.enabled ? html`
+          <${AccountSignIn} onDone=${()=>store.patch('session',{entered:true})} />
+          <${Button} variant="ghost" size="lg" block=${true} onClick=${()=>store.patch('session',{entered:true})}>先浏览在线大厅<//>` : html`
         <${TextField} label="博士代号" micro="CALLSIGN" size="lg" icon="user" value=${name} maxLength=${NAME_MAX_LEN}
           placeholder="输入你的代号（最多 ${NAME_MAX_LEN} 字）" autoFocus=${!touchUi}
           onInput=${setName} onEnter=${start} />
