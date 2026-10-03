@@ -39,7 +39,9 @@
     "deploy:worker": "wrangler deploy",
     "resources:manifest": "node tools/resource-pack.mjs --manifest-only",
     "resources:pack": "node tools/resource-pack.mjs",
-    "resources:zip": "node tools/vendor.mjs && node tools/fetch-assets.mjs && node tools/resource-pack.mjs --out=."
+    "resources:zip": "node tools/vendor.mjs && node tools/fetch-assets.mjs && node tools/resource-pack.mjs --out=.",
+    "rules:check": "node tools/rules-version-guard.mjs check",
+    "rules:record": "node tools/rules-version-guard.mjs record"
   },
   "engines": {
     "node": ">=22"

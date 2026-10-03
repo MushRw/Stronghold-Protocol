@@ -60,6 +60,25 @@ node tools/fetch-assets.mjs --offline
 5. **`e instanceof AccountError` 对跨 DO RPC 的错误无效**（原型丢失，`code`/`status` 仍在）。判断错误要用鸭子类型，并把未知错误 `console.error` 留痕，不要静默压成一个 `AUTH_FAILED`。
 6. **RPC 不能传函数**。把闭包传进 DO 方法会让 workerd 去序列化它的捕获环境（例如 `SqlStorage`），报 `Could not serialize object of type "SqlStorage"`。诊断类方法应当由 DO 自己算好再返回纯数据对象。
 
+## 部署前守卫（已接入）
+
+`wrangler.jsonc` 的 `build.command` 现在是：
+
+```
+npm run build:worker && node tools/rules-version-guard.mjs check
+```
+
+它会读出刚构建产物里的规则版本号，与 `.cache/deployed-rules-version`（上次部署后由 `npm run rules:record` 写入）比对：
+
+- **相同** → 放行，并提示"可与进行中的对局并存"
+- **不同** → **拒绝部署并返回非零退出码**，打印为什么这会等同于踢人；确认没有对局在进行时可用 `SP_ALLOW_RULES_CHANGE=1 npm run deploy:worker` 强制通过
+
+部署成功后记得记录新版本：
+
+```bash
+npm run rules:record
+```
+
 ## 改动游戏规则前必读
 
 `rulesVersion` = `server/` + `shared/` + `data/`（以及 `worker/replay-engine.js`、`worker/recovery-engine.js`、`worker/data-loader.js`、`worker/sim-data-loader.js`、构建脚本）的哈希。
@@ -93,6 +112,10 @@ fetch('/api/admin/diag',{headers:{'X-Admin-Token':'<你的令牌>'}}).then(r=>r.
 - `/api/rooms` 返回 **403 `NOT_APPROVED`** → 账号还没批准（或被拒绝）。
 - 返回 **409 `ALREADY_SEATED`** → 名下还有有效席位；若房间已消失会自动释放（见下）。
 - 返回 **429 `RATE`** → 同网络短时间请求过多，等一分钟。
+
+## 磁盘卫生
+
+每次构建前先 `mv dist .dist-old-$(date +%H%M%S)`（原因见上），这些目录会累积，每个约 0.9 GB。清理时**请在资源管理器里 Shift+Delete 直接删除**：本机环境下 `rm` 会把文件移入同盘回收站，**不会释放空间**，而且回收站属于用户，不应由工具代劳清理。
 
 ## 本轮修复记录
 

@@ -17,7 +17,7 @@
   "previews": {},
   // Custom domains and routes are managed in the Cloudflare dashboard.
   // Omit route/routes so deployments preserve those bindings.
-  "build": { "command": "npm run build:worker" },
+  "build": { "command": "npm run build:worker && node tools/rules-version-guard.mjs check" },
   "assets": {
     "directory": "./dist/client",
     "binding": "ASSETS",
