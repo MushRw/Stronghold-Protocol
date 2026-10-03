@@ -3,6 +3,7 @@ import { APP_VERSION } from '../shared/constants.js';
 import { CODE_ALPHABET } from '../server/lobby.js';
 import { normalizeIp, limitKeyOf, TokenBucket } from '../server/net.js';
 import { RoomRuntime, validCode } from './room-runtime.js';
+import { prepareMatchVersion } from './match-versions.js';
 import { PACK_PATH, servePack } from './pack.js';
 import { handleAuth, approvedSession, accountOf, directoryOf } from './accounts/auth.js';
 import { handleAdminRoutes, adminConfigured } from './accounts/admin.js';
@@ -185,12 +186,19 @@ export class RoomDurableObject {
       }
       if(snapshot?.matchCheckpoint?.eventLogId) {
         const c=snapshot.matchCheckpoint;
-        c.events=ctx.storage.sql.exec('SELECT payload FROM match_events WHERE match_id=? ORDER BY seq',c.eventLogId).toArray().map(r=>JSON.parse(r.payload));
-        if(c.events.length!==c.eventCount) throw new Error('INCOMPLETE_MATCH_LOG');
+        const count=ctx.storage.sql.exec('SELECT COUNT(*) AS count FROM match_events WHERE match_id=?',c.eventLogId).one().count;
+        if(count!==c.eventCount) throw new Error('INCOMPLETE_MATCH_LOG');
+        // Retained engines require an Array, but only iterate it during restoration.
+        // Stream rows instead of keeping SQL payloads and parsed events together.
+        c.events=new Array(count);
+        c.events[Symbol.iterator]=function*(){
+          for(const row of ctx.storage.sql.exec('SELECT payload FROM match_events WHERE match_id=? ORDER BY seq',c.eventLogId))yield JSON.parse(row.payload);
+        };
         this.persistedLogId=c.eventLogId;this.persistedEventCount=c.events.length;
       }
 
       this.parts = meta?.parts || 0;
+      await prepareMatchVersion(snapshot?.matchCheckpoint?.rulesVersion);
       this.runtime = new RoomRuntime({ snapshot, accounts: !!env.ACCOUNTS, onChange: () => this.queuePersist() });
       for (const ws of ctx.getWebSockets()) {
         // Closing sockets may still be enumerated; never rebind one over its replacement.
@@ -320,7 +328,7 @@ export class RoomDurableObject {
       if(room) {
         const listing={roomId:rt.code,generation:rt.generation,public:rt.publicRoom && room.mode==='coop',
           connectedHumans:room.activeHumans().filter(s=>s.connected).length,occupied:room.seats.filter(Boolean).length,
-          capacity:4,inMatch:!!room.match,hostName:room.seatOf(room.hostId)?.name || '博士',difficulty:room.difficulty};
+          capacity:4,inMatch:!!room.match,spectatorCount:rt.spectators.count,hostName:room.seatOf(room.hostId)?.name || '博士',difficulty:room.difficulty};
         const fingerprint=JSON.stringify(listing);
         if(fingerprint!==this.lastListing || now-(this.lastPublished || 0)>=20000) {
           this.lastListing=fingerprint;this.lastPublished=now;
@@ -372,14 +380,16 @@ export class RoomDurableObject {
       if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return error(426, 'BAD_MSG');
       if (!rt.canConnect() || url.searchParams.get('room') !== rt.code) return error(404, 'ROOM_NOT_FOUND');
       const ip = request.headers.get('X-Room-IP') || '0.0.0.0';
-      if (rt.admission(ip)) return error(429, 'RATE', 'connection limit');
+      if (rt.admission(ip,request.headers.get('X-Account-ID'))) return error(429, 'RATE', 'connection limit');
+      const profile = this.env.ACCOUNTS && request.headers.get('X-Account-ID')
+        ? await accountOf(this.env,request.headers.get('X-Account-ID')).getProfile() : null;
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.ctx.acceptWebSocket(server);
       const adapter = new SocketAdapter(server,!!this.env.ACCOUNTS);
       this.sockets.set(server, adapter);
       rt.connect(adapter, { ip, ticket: url.searchParams.get('ticket'), accountId: request.headers.get('X-Account-ID'),
-        sessionId:request.headers.get('X-Session-ID') });
+        sessionId:request.headers.get('X-Session-ID'), avatarUrl:profile?.avatarUrl ?? null });
       await this.persistNow();
       return new Response(null, { status: 101, webSocket: client });
     });

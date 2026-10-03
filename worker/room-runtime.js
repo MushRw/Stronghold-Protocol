@@ -5,10 +5,11 @@ import { Match } from '../server/match/Match.js';
 import { VirtualScheduler } from '../server/match/scheduler.js';
 import { Lobby, Room, CODE_ALPHABET } from '../server/lobby.js';
 import { Network, Session, SessionRegistry, sendSession, normalizeIp, limitKeyOf } from '../server/net.js';
-import { ERR } from '../shared/constants.js';
+import { ERR, MAX_SEATS } from '../shared/constants.js';
 import { RecordedMatch, exportMatch, restoreMatch } from '../server/match/checkpoint.js';
 import { ApplicationQueue } from './rooms/applications.js';
 import { retainedMatchVersions } from './match-versions.js';
+import { Spectators } from './rooms/spectators.js';
 
 export const ROOM_LIMITS = Object.freeze({ sockets: 16, socketsPerIp: 8, sessions: 32, messageBytes: 65_536,
   reservationMs: 120_000, idleSocketMs: 90_000 });
@@ -43,7 +44,7 @@ class RoomNetwork extends Network {
       if (presented && presented.accountId !== meta.accountId) {
         this.reply(conn, {t: 'error', code: ERR.BAD_MSG, detail: 'account mismatch', rid: msg.rid}); return;
       }
-      if (previous && !conn.session && !meta.takeover && token !== previous.token) {
+      if (previous && this.roomRuntime.lobby.roomOf(previous) && !conn.session && !meta.takeover && token !== previous.token) {
         this.reply(conn, {t: 'error', code: ERR.BAD_MSG, detail: 'resume required', rid: msg.rid}); return;
       }
       token = previous?.token;
@@ -67,6 +68,7 @@ class AlarmLobby extends Lobby {
   onMatchEnd(room, ctx, summary) {
     this.onArchive?.(room,ctx,summary);
     super.onMatchEnd(room, ctx, summary);
+    this.onSpectatorEnd?.();
     this.onChange?.();
   }
   expireGrace() {
@@ -100,6 +102,12 @@ export class RoomRuntime {
     // Always alarm-driven: the platform listens to the room, so neither mode may run an in-memory timer.
     this.lobby = new AlarmLobby({ registry: this.registry, now, options: { maxRooms: 1 }, MatchClass: accounts ? RecordedMatch : AlarmMatch });
     this.lobby.genCode = () => this.code;
+    this.spectators=new Spectators(this);
+    this.lobby.onSpectatorEnd=()=>this.spectators.pump();
+    this.lobby.broadcastState=()=>this.spectators.presence();
+    this.lobby.sendState=(room,session)=>this.spectators.state(session);
+    const broadcast=this.lobby.broadcastRoom.bind(this.lobby);
+    this.lobby.broadcastRoom=(room,msg)=>{const result=broadcast(room,msg);this.spectators.broadcast(msg);return result;};
     this.lobby.onChange = onChange;
     this.lobby.onArchive=(room,ctx,summary)=>{
       const match=ctx.match;
@@ -121,14 +129,17 @@ export class RoomRuntime {
         const meta = this.socketMeta.get(s.ws);
         if (this.accounts && meta?.accountId) {
           s.accountId = meta.accountId;
+          if (meta.avatarUrl !== undefined) s.avatarUrl = meta.avatarUrl;
           if (!info.repeat) s.connectionEpoch = (s.connectionEpoch || 0) + 1;
           meta.connectionEpoch = s.connectionEpoch;
         }
         if (this.socketMeta.get(s.ws)?.canCreate && this.reservation) s.canCreate = true;
-        this.lobby.onHello(s, info);
+        if(s.spectating)this.spectators.hello(s);else this.lobby.onHello(s, info);
         if (this.interruptedUntil > this.now()) sendSession(s, { t: 'room.closed', reason: 'restart' });
       },
       onMessage: (s, msg) => {
+        if(msg.t==='room.spectate')return this.spectators.join(s);
+        if(s.spectating)return this.spectators.command(s,msg);
         if(this.accounts && msg.t==='room.start') {
           const room=this.lobby.roomOf(s);
           if(room && !room.match) room.archiveParticipants=room.activeHumans().map(p=>({
@@ -156,9 +167,9 @@ export class RoomRuntime {
         if(!result.error && msg.t==='room.start') this.applications.invalidate();
         return result;
       },
-      routeGame: (s, msg) => this.lobby.routeGame(s, msg),
-      onDisconnect: (s) => this.lobby.onDisconnect(s),
-      onExpire: (s) => this.lobby.onExpire(s),
+      routeGame: (s, msg) => s.spectating?this.spectators.command(s,msg):this.lobby.routeGame(s, msg),
+      onDisconnect: (s) => {if(s.spectating){this.spectators.views.delete(s.playerId);this.spectators.presence();}else this.lobby.onDisconnect(s);},
+      onExpire: (s) => {if(s.spectating)this.spectators.leave(s);else this.lobby.onExpire(s);},
     };
     for(const key of ['onMessage','routeGame']) {
       const original=handler[key];
@@ -249,14 +260,22 @@ export class RoomRuntime {
       && this.interruptedUntil <= this.now();
   }
   canConnect() { return !!this.code && !this.isEmpty(); }
-  admission(ip) {
+  admission(ip, accountId) {
     if (this.network.connectionCount >= ROOM_LIMITS.sockets) return 'full';
     const key = limitKeyOf(normalizeIp(ip) || '0.0.0.0');
     if ([...this.socketMeta.values()].filter((m) => m.key === key).length >= ROOM_LIMITS.socketsPerIp) return 'per-address';
+    if(this.accounts && this.lobby.getRoom(this.code)?.match && !this.hasAccount(accountId)) {
+      // Reserve every player seat plus one overlap during authenticated reconnect.
+      // Include sockets still awaiting hello so connection churn cannot steal the reserve.
+      const observers=[...this.socketMeta.values()].filter(m=>!this.hasAccount(m.accountId));
+      const reserve=MAX_SEATS+1;
+      if(observers.length>=ROOM_LIMITS.sockets-reserve)return 'spectators-full';
+      if(observers.filter(m=>m.key===key).length>=ROOM_LIMITS.socketsPerIp-reserve)return 'spectators-per-address';
+    }
     return null;
   }
-  connect(ws, { ip = '0.0.0.0', ticket, attachment, accountId, sessionId, takeover = false } = {}) {
-    if (!attachment && this.admission(ip)) { ws.close(1013, 'connection limit'); return; }
+  connect(ws, { ip = '0.0.0.0', ticket, attachment, accountId, sessionId, avatarUrl, takeover = false } = {}) {
+    if (!attachment && this.admission(ip,accountId)) { ws.close(1013, 'connection limit'); return; }
     const normalized = normalizeIp(ip) || '0.0.0.0';
     const resume=this.resumeTickets.get(ticket);
     if (resume && resume.accountId===accountId && resume.expiresAt>this.now()) {
@@ -264,6 +283,7 @@ export class RoomRuntime {
     }
     this.socketMeta.set(ws, { ip: normalized, key: limitKeyOf(normalized),
       accountId: attachment?.accountId || accountId, takeover,
+      avatarUrl: attachment?.avatarUrl ?? avatarUrl,
       joinTicket:attachment?.joinTicket || ticket,
       sessionId:attachment?.sessionId || sessionId, connectionEpoch:attachment?.connectionEpoch,
       canCreate: !!attachment?.canCreate || !!(ticket && this.reservation && ticket === this.reservation.ticket &&
@@ -323,7 +343,7 @@ export class RoomRuntime {
     if (this.reservation && this.reservation.expiresAt <= this.now()
       && ![...this.registry.all()].some((s) => s.canCreate && s.connected)) this.reservation = null;
   }
-  pump(now=this.now()) {return this.lobby.getRoom(this.code)?.match?.pump?.(now) || 0;}
+  pump(now=this.now()) {const result=this.lobby.getRoom(this.code)?.match?.pump?.(now) || 0;this.spectators.pump();return result;}
   reconcileSockets() {
     const match=this.lobby.getRoom(this.code)?.match;if(!match)return;
     for(const player of match.order) {

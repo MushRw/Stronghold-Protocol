@@ -90,7 +90,7 @@ export async function copyRuntimeAssets({ root = ROOT, out = path.join(root, 'di
     }
   }
   await check(out);
-  if (count > 20000) throw new Error(`Static asset count ${count} exceeds the free plan limit`);
+  if (count > 100000) throw new Error(`Static asset count ${count} exceeds the Workers Paid limit`);
   return { out, count };
 }
 
@@ -140,12 +140,14 @@ export async function buildWorker({ root = ROOT } = {}) {
     if((await fs.stat(path.join(target,'engine.js'))).size>25*1024*1024)throw new Error('Retained replay engine exceeds static asset limit: '+version.id);
     assets.count++;
   }
-  if(assets.count + pack.parts.length + 1>20000)throw new Error('Retained engines exceed static asset count limit');
-  await bundleWorker({ root, buildTag, rulesVersion:versions.current, versionModules:versions.entries });
-  const compressed=gzipSync(await fs.readFile(path.join(root,'dist/worker/index.mjs'))).length;
-  const limit=process.env.SP_WORKER_PAID_PLAN==='1'?10:3;
-  if(compressed>limit*1024*1024)throw new Error(`Worker gzip ${(compressed/1024/1024).toFixed(2)} MiB exceeds configured ${limit} MiB plan limit. Preserve published engines; plan a version-storage migration before deploying.`);
-  console.log(`Worker gzip ${(compressed/1024/1024).toFixed(2)} MiB; ${versions.entries.length} retained rules version(s)`);
+  if(assets.count + pack.parts.length + 1>100000)throw new Error('Retained engines exceed static asset count limit');
+  // Current matches restore through the main engine; do not embed a second copy of it.
+  await bundleWorker({ root, buildTag, rulesVersion:versions.current, versionModules:versions.entries.filter(v=>v.id!==versions.current) });
+  const bundleBytes=await fs.readFile(path.join(root,'dist/worker/index.mjs'));
+  const compressed=gzipSync(bundleBytes).length;
+  // Cloudflare's September 2026 limit is 64 MiB uncompressed; gzip is informational.
+  if(bundleBytes.length>64*1024*1024)throw new Error('Worker exceeds the 64 MiB uncompressed limit. Preserve published engines; plan a version-storage migration before deploying.');
+  console.log(`Worker ${(bundleBytes.length/1024/1024).toFixed(2)} MiB uncompressed / gzip ${(compressed/1024/1024).toFixed(2)} MiB; ${versions.entries.length} retained rules version(s)`);
   console.log(`Workers build: ${assets.count} static files; resource version ${manifest.version}, ${(manifest.totalBytes / 1024 / 1024).toFixed(1)} MiB`);
   console.log(`Workers build: commit ${buildTag}; resource ZIP ${pack.size} bytes in ${pack.parts.length} parts`);
   return { assets, manifest, pack };
@@ -212,9 +214,25 @@ export async function bundleWorker({ root = ROOT, outfile = path.join(root, 'dis
     external: ['node:*', 'cloudflare:*'], minify: true, keepNames: true, metafile: true,
     define: { __SP_BUILD__: JSON.stringify(buildTag), __SP_RULES_VERSION__: JSON.stringify(rulesVersion) },
     plugins: [{ name: 'worker-data-loaders', setup(builder) {
+      // Keep immutable recovery bundles, but initialize only the version a room restores.
+      // Eagerly initializing every historical engine exceeds the Worker startup CPU budget.
+      builder.onLoad({filter:/\.mjs$/},async args=>{
+        if(!versionModules.some(v=>path.resolve(v.file || path.join(root,'.replay-engines',v.id,'recovery.mjs'))===args.path))return;
+        let source=await fs.readFile(args.path,'utf8');
+        // Restoration compares only view/RNG. Avoid cloning the entire event history
+        // in old exportMatch implementations just to discard that clone immediately.
+        const eventDefault=/referenceEvents:([A-Za-z_$][\w$]*)=!1/g;
+        if([...source.matchAll(eventDefault)].length!==1)throw new Error('Unsupported recovery event export: '+args.path);
+        source=source.replace(eventDefault,'referenceEvents:$1=!0');
+        const exports=source.match(/export\{([^}]+)\};\s*$/);
+        if(!exports)throw new Error('Unsupported retained recovery exports: '+args.path);
+        const pairs=exports[1].split(',').map(s=>{const m=s.trim().match(/^(\w+) as (\w+)$/);if(!m)throw new Error('Unsupported recovery export');return `${m[2]}:${m[1]}`;});
+        const body=source.slice(0,exports.index)+`return {${pairs.join(',')}};`;
+        return {loader:'js',contents:`let cached,pending;export async function prepare(){return cached || (pending ||= (async()=>{${body}})().then(value=>cached=value));}export function restore(...args){if(!cached)throw new Error('Recovery engine not prepared');return cached.restore(...args);}`};
+      });
       if(versionModules.length) builder.onLoad({filter:/[\\/]worker[\\/]match-versions\.js$/},()=>({loader:'js',contents:
-        versionModules.map((v,i)=>`import {restore as r${i}} from ${JSON.stringify(v.file || path.join(root,'.replay-engines',v.id,'recovery.mjs'))};`).join('\n')+
-        `\nexport const retainedMatchVersions={${versionModules.map((v,i)=>`${JSON.stringify(v.id)}:r${i}`).join(',')}};`}));
+        versionModules.map((v,i)=>`import {restore as r${i},prepare as p${i}} from ${JSON.stringify(v.file || path.join(root,'.replay-engines',v.id,'recovery.mjs'))};`).join('\n')+
+        `\nexport const retainedMatchVersions={${versionModules.map((v,i)=>`${JSON.stringify(v.id)}:r${i}`).join(',')}};const preparers={${versionModules.map((v,i)=>`${JSON.stringify(v.id)}:p${i}`).join(',')}};export async function prepareMatchVersion(id){await preparers[id]?.();}`}));
       builder.onResolve({ filter: /(?:data-node|nodeData)\.js$/ }, args => {
         const replacement = replacements.get(path.resolve(args.resolveDir, args.path));
         return replacement ? { path: replacement } : undefined;
