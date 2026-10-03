@@ -7,7 +7,9 @@ export const ACCOUNT_LIMITS = Object.freeze({
  * never leaves the browser in a recoverable form — the site directory only stores a PBKDF2 verifier.
  */
 export const LOCAL_AUTH = Object.freeze({
-  iterations: 210000, minPassword: 8, maxPassword: 128, maxLogin: 24,
+  // workerd's WebCrypto rejects a PBKDF2 iteration count above 100000 ("Pbkdf2 failed: iteration counts
+  // above 100000 are not supported"), so this is the platform ceiling, not a free choice.
+  iterations: 100000, minPassword: 8, maxPassword: 128, maxLogin: 24,
   statuses: ['pending', 'approved', 'rejected'],
 });
 export class AccountError extends Error {

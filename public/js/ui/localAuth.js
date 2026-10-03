@@ -42,7 +42,10 @@ export function LocalAuthForm({ onDone, compact = false, autoFocus = false }) {
       net.close();
       onDone ? onDone() : location.reload();
     } catch (e) {
-      setNotice(e.message);
+      // A rejected account must not be told to wait for approval.
+      setNotice(e.code === 'NOT_APPROVED' && e.status === 'rejected'
+        ? '这个账号已被拒绝，如果认为是误判，请联系房主。'
+        : e.message);
       if (e.code === 'NOT_APPROVED') { setMode('login'); setPassword(''); }
     } finally {
       setBusy(false);

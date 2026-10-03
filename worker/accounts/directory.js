@@ -114,6 +114,15 @@ export class SiteDirectory extends DurableObject {
     return row && row.expires_at > Date.now() ? JSON.parse(row.value) : null;
   }
   revokeSession(key) { this.sql.exec('DELETE FROM auth_records WHERE key=?', 'session:' + key); }
+  /** Read-only size report for the operator console. Returns plain numbers: a callback crossing the
+   *  RPC boundary would drag this object's SqlStorage along with it. */
+  async diagnostics() {
+    const count = (table) => this.sql.exec(`SELECT COUNT(*) AS n FROM ${table}`).one().n;
+    return {
+      users: count('users'), local_auth: count('local_auth'), auth_records: count('auth_records'),
+      rooms: count('rooms'), archives: count('archives'), kvKeys: (await this.ctx.storage.list()).size,
+    };
+  }
   registerArchive(matchId) {this.sql.exec('INSERT OR IGNORE INTO archives VALUES (?)',matchId);}
   backupCatalog({cursor='',kind='profiles',limit=100}={}) {
     if(typeof cursor!=='string' || cursor.length>128 || !Number.isInteger(limit) || limit<1 || limit>100)throw new AccountError('INVALID_PAGE');

@@ -48,3 +48,8 @@ dist/
 .dev.vars.*
 .replay-engines/
 public/resource-manifest.json
+
+# --- build leftovers kept for debugging (see docs/SELF-HOSTED-DEPLOY.md) ----------------------------
+.dist-*/
+.replay-engines-bak-*/
+.write-probe

@@ -32,12 +32,32 @@ async function admit(env, ip, kind) {
   return result.ok ? null : result;
 }
 
+/**
+ * A seat claim only means something while the room still lists that account. A client that reserved a
+ * room and never finished connecting (closed tab, refused upgrade, lost network) leaves a claim behind,
+ * and because claims carry a lease that is never renewed, that dead claim would lock the account out of
+ * every room from then on. So confirm with the room before refusing, and drop the claim when it is dead.
+ */
+async function liveSeat(env, session) {
+  const account = accountOf(env, session.accountId);
+  const seat = await account.getActiveSeat();
+  if (!seat) return null;
+  let live = false;
+  try {
+    const response = await roomStub(env, seat.roomId).fetch(new Request('https://room.internal/_account', {
+      headers: { 'X-Account-ID': session.accountId, 'X-Room-Generation': seat.roomGeneration } }));
+    live = response.ok;
+  } catch { live = false; }
+  if (!live) { await account.releaseSeat({ claimId: seat.claimId }); return null; }
+  return seat;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
     const backup=await handleBackupRoutes(request,env);if(backup)return backup;
-    if (path === '/admin') return adminConfigured(env) ? new Response(ADMIN_PAGE, adminPageHeaders()) : error(404, 'NOT_FOUND');
+    if (path === '/admin') return adminConfigured(env) ? new Response(ADMIN_PAGE, { headers: adminPageHeaders() }) : error(404, 'NOT_FOUND');
     if(env.ADMISSION && (path.startsWith('/api/auth/') || path==='/api/rooms' && request.method==='GET' || /\/applications$/.test(path))) {
       const kind=path.startsWith('/api/auth/local')||path==='/api/auth/register'||path==='/api/auth/login'?'localauth'
         :path.startsWith('/api/auth/')?'auth':request.method==='GET'?'status':'application';
@@ -66,7 +86,7 @@ export default {
       if (gate.error) return error(gate.error.status, gate.error.code);
       const session = gate.session;
       if (session && request.headers.get('Origin') !== url.origin) return error(403, 'BAD_MSG');
-      if (session && await accountOf(env, session.accountId).getActiveSeat()) return error(409, 'ALREADY_SEATED');
+      if (session && await liveSeat(env, session)) return error(409, 'ALREADY_SEATED');
       const limited = await admit(env, edgeIp(request), 'reserve');
       if (limited) return limited;
       for (let i = 0; i < 12; i++) {

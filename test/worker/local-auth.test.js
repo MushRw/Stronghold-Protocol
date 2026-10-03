@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createAccountHarness } from './helpers/account-harness.js';
 import { bundleWorker } from '../../tools/build-worker.mjs';
+import { LOCAL_AUTH } from '../../shared/account-protocol.js';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -46,6 +47,13 @@ async function harness(t) {
   const admin = (path, options = {}) => call(path, { ...options, headers: { 'X-Admin-Token': ADMIN_TOKEN, ...(options.headers || {}) } });
   return { h, call, post, admin };
 }
+
+test('the PBKDF2 iteration count stays inside the platform ceiling', () => {
+  // workerd refuses more than 100000 rounds at runtime; Miniflare does not enforce it, so a local test
+  // passes while production registration fails with a 502. Keep the ceiling asserted here.
+  assert.ok(LOCAL_AUTH.iterations <= 100000, `iterations=${LOCAL_AUTH.iterations} exceeds what workerd accepts`);
+  assert.ok(LOCAL_AUTH.iterations >= 10000, 'too few rounds to cost an offline attacker anything');
+});
 
 const cookieOf = (response) => (response.headers.get('set-cookie') || '').split(';')[0];
 const login = { login: '博士', password: 'correct-horse-battery' };
@@ -146,4 +154,26 @@ test('the admin surface stays hidden until a long enough token is configured', {
     method: 'POST', headers: { Origin: ORIGIN, 'Content-Type': 'application/json' }, body: JSON.stringify({ login: 'x', password: 'yyyyyyyy' }),
   });
   assert.equal(local.status, 201, 'self-hosted accounts are on by default when the account DO is bound');
+});
+
+// The room holds a reservation for ROOM_LIMITS.reservationMs (120s), so the dead-claim case can only
+// be observed after that lease lapses. Slow by nature: this is the guard for a permanent account lockout.
+test('a reservation the client never connected to does not lock the account out', { timeout: 300000 }, async (t) => {
+  const { call, post, admin } = await harness(t);
+  await post('/api/auth/register', { login: 'stranded', password: 'another-long-secret' });
+  await admin('/api/admin/review', { method: 'POST', body: { login: 'stranded', status: 'approved' } });
+  const cookie = cookieOf(await post('/api/auth/login', { login: 'stranded', password: 'another-long-secret' }));
+
+  // Reserving claims a seat, but this client never opens the WebSocket, so it never enters the room.
+  const first = await call('/api/rooms', { method: 'POST', cookie });
+  assert.equal(first.status, 201, await first.clone().text());
+  const firstCode = (await first.json()).code;
+  // While the room still holds the 30s reservation lease the claim is legitimate.
+  assert.equal((await call('/api/rooms', { method: 'POST', cookie })).status, 409, 'a live reservation is still a seat');
+
+  // After the lease lapses the room forgets the account; the claim must not stay forever.
+  await new Promise((r) => setTimeout(r, 125000));
+  const second = await call('/api/rooms', { method: 'POST', cookie });
+  assert.equal(second.status, 201, 'a dead reservation must be released, not honoured: ' + await second.clone().text());
+  assert.notEqual((await second.json()).code, firstCode);
 });

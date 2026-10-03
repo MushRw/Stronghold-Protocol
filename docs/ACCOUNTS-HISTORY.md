@@ -20,7 +20,7 @@
 
 - 入口：标题页的「代号 + 密码」表单，登录与注册在同一处切换；`GET /api/me` 的 `capabilities.localAuth` 为真时前端显示该表单而不是 GitHub 按钮。
 - 接口：`POST /api/auth/register`（代号、密码）只创建 `pending` 账号并返回提示，**不下发会话**；`POST /api/auth/login` 校验口令，密码错误一律 401（不区分"不存在"与"密码错"），未审核返回 403 `NOT_APPROVED`。
-- 口令只存 PBKDF2-HMAC-SHA256 散列（210000 轮，16 字节随机盐，走 WebCrypto，不计入免费层 JS CPU）；站点不保存、也无法找回明文。
+- 口令只存 PBKDF2-HMAC-SHA256 散列（100000 轮 = workerd 允许的上限，16 字节随机盐，走 WebCrypto，不计入免费层 JS CPU）；站点不保存、也无法找回明文。
 - 审核闸门在 `approvedSession()`：`POST /api/rooms`（拿房间票）与 `GET /ws` 都要"已登录 + 已批准"。被拒绝的账号会当场删除已有会话，不能继续用旧 cookie 上线。
 - 限流：注册与登录走独立的 `localauth` 桶（每分钟 20 次、突发 10），比 GitHub 跳转宽松，但仍限制 PBKDF2 的计算量。
 - 外部登录（GitHub）创建的账号没有审核状态，直接视为已批准，两者可以共存。

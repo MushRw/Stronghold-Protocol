@@ -1,15 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "stronghold-protocol",
-  "account_id": "04c35e69fed6151decdffdd2952f7771",
   "main": "dist/worker/index.mjs",
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
   "preview_urls": false,
   "vars": {
-    "AUTH_ORIGIN": "https://stronghold.lunar.ag",
-    "GITHUB_CLIENT_ID": "Ov23liVRPUgvbQPtKkoo",
+    "AUTH_ORIGIN": "https://protocol.cc.cd",
     // Self-hosted accounts: a callsign + password that an operator reviews by hand at /admin.
     // Set to "0" to keep GitHub as the only way in. ADMIN_TOKEN (>= 32 chars) is a *secret*:
     //   npx wrangler secret put ADMIN_TOKEN
@@ -23,7 +21,7 @@
   "assets": {
     "directory": "./dist/client",
     "binding": "ASSETS",
-    "run_worker_first": ["/api/*", "/ws", "/healthz", "/stronghold-resources.zip"],
+    "run_worker_first": ["/api/*", "/ws", "/healthz", "/admin", "/stronghold-resources.zip"],
     "not_found_handling": "none"
   },
   "durable_objects": {

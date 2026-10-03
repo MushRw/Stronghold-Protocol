@@ -172,8 +172,8 @@ export async function handleAuth(request, env, {now = Date.now, fetch: providerF
       return new Response(null,{status:303,headers:{Location:'/?authError=1','Cache-Control':'no-store','Set-Cookie':cookie(OAUTH_COOKIE,'',0)}});
     // Duck-typed on purpose: an AccountError raised inside a Durable Object comes back over RPC
     // without its prototype, so instanceof would report every cross-DO failure as a 502.
-    const code = typeof e?.code === 'string' ? e.code : 'AUTH_FAILED';
-    const status = Number.isInteger(e?.status) ? e.status : 502;
-    return json({error: code}, status);
+    const known = typeof e?.code === 'string' && Number.isInteger(e?.status);
+    if (!known) console.error('[auth]', url.pathname, e?.stack || e?.message || e);
+    return json({ error: known ? e.code : 'AUTH_FAILED' }, known ? e.status : 502);
   }
 }

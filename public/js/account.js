@@ -9,7 +9,7 @@ export async function accountRequest(path,body,fetchFn=globalThis.fetch) {
     headers:body===undefined?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});
   if(response.status===204) return null;
   const result=await response.json();
-  if(!response.ok) {const e=new Error(ERRORS[result.error] || result.error || '请求失败，请重试');e.code=result.error;throw e;}
+  if(!response.ok) {const e=new Error(ERRORS[result.error] || result.error || '请求失败，请重试');e.code=result.error;e.status=result.status;throw e;}
   return result;
 }
 export async function loadAccount(fetchFn=globalThis.fetch) {

@@ -123,6 +123,12 @@ export async function buildWorker({ root = ROOT } = {}) {
     const run = spawnSync(process.execPath, [path.join(root, 'tools/fetch-assets.mjs')], { cwd: root, stdio: 'inherit' });
     if (run.status !== 0) throw new Error('tools/fetch-assets.mjs failed: the game assets could not be downloaded — retry the deploy');
   }
+  // A Durable Object isolate loads and evaluates the whole script, so every embedded historical engine
+  // is memory a live room can never afford: at ~11 MiB each, keeping them made every DO exceed its
+  // 128 MiB limit and reset on wake. A fresh site has nothing to restore, so dropping is the default
+  // and keeping the history is an explicit opt-in for deployments that have old matches to recover.
+  const keepRetained = process.env.SP_KEEP_RETAINED_VERSIONS === '1';
+  const dropRetained = !keepRetained;
   const { buildReplayVersions } = await import('./build-replay.mjs');
   const versions = await buildReplayVersions({root,bundle:bundleWorker});
   const { buildResourceManifest } = await import('./resource-pack.mjs');
@@ -133,7 +139,7 @@ export async function buildWorker({ root = ROOT } = {}) {
   const buildTag = buildId({ root });
   const assets = await copyRuntimeAssets({ root, buildTag });
   const pack = await writePackParts({ root, manifest });
-  for(const version of versions.entries) {
+  for(const version of dropRetained ? [] : versions.entries) {
     const target=path.join(assets.out,'replay-engines',version.id);
     await fs.mkdir(target,{recursive:true});
     await fs.copyFile(path.join(root,'.replay-engines',version.id,'engine.js'),path.join(target,'engine.js'));
@@ -142,11 +148,23 @@ export async function buildWorker({ root = ROOT } = {}) {
   }
   if(assets.count + pack.parts.length + 1>100000)throw new Error('Retained engines exceed static asset count limit');
   // Current matches restore through the main engine; do not embed a second copy of it.
-  await bundleWorker({ root, buildTag, rulesVersion:versions.current, versionModules:versions.entries.filter(v=>v.id!==versions.current) });
+  // SP_DROP_RETAINED_VERSIONS=1 is for a *fresh* deployment: there is no old match to restore, and
+  // every embedded engine is source that each Durable Object isolate has to load and evaluate.
+  if (dropRetained && versions.entries.some((v) => v.id !== versions.current)) {
+    console.log(`[build] no historical rules engines embedded (${versions.entries.length - 1} dropped). ` +
+      `Matches started before an earlier deploy will not restore; set SP_KEEP_RETAINED_VERSIONS=1 to keep them.`);
+  }
+  await bundleWorker({ root, buildTag, rulesVersion:versions.current,
+    versionModules: dropRetained ? [] : versions.entries.filter(v => v.id !== versions.current) });
   const bundleBytes=await fs.readFile(path.join(root,'dist/worker/index.mjs'));
   const compressed=gzipSync(bundleBytes).length;
   // Cloudflare's September 2026 limit is 64 MiB uncompressed; gzip is informational.
   if(bundleBytes.length>64*1024*1024)throw new Error('Worker exceeds the 64 MiB uncompressed limit. Preserve published engines; plan a version-storage migration before deploying.');
+  // Every Durable Object loads this script, and a 128 MiB isolate cannot hold a bundle this large:
+  // the objects would reset on wake and the site would fail at runtime instead of at build time.
+  if(bundleBytes.length>24*1024*1024)throw new Error(`Worker is ${(bundleBytes.length/1024/1024).toFixed(1)} MiB, ` +
+    'over the 24 MiB budget a Durable Object isolate can load. Historical replay engines are the usual cause: ' +
+    'they are embedded per version (~11 MiB each). Move them to R2 instead of the bundle.');
   console.log(`Worker ${(bundleBytes.length/1024/1024).toFixed(2)} MiB uncompressed / gzip ${(compressed/1024/1024).toFixed(2)} MiB; ${versions.entries.length} retained rules version(s)`);
   console.log(`Workers build: ${assets.count} static files; resource version ${manifest.version}, ${(manifest.totalBytes / 1024 / 1024).toFixed(1)} MiB`);
   console.log(`Workers build: commit ${buildTag}; resource ZIP ${pack.size} bytes in ${pack.parts.length} parts`);
