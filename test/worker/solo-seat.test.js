@@ -19,9 +19,13 @@ async function seatHarness(t) {
   const file = path.join(dir, 'worker.mjs').replaceAll('\\', '/');
   const session = (actor) => ACTORS[actor] || ACTORS.a;
   const source = `
-    import worker,{SiteDirectory,AccountDurableObject,RoomDurableObject,AdmissionDurableObject,MatchArchive} from ${JSON.stringify(file)};
+    import worker,{SiteDirectory,AccountDurableObject as ProductionAccount,RoomDurableObject,AdmissionDurableObject,MatchArchive} from ${JSON.stringify(file)};
     import {hash} from './worker/accounts/auth.js';
-    export {SiteDirectory,AccountDurableObject,RoomDurableObject,AdmissionDurableObject,MatchArchive};
+    // Ageing a claim needs storage access, and the production object exposes no such route.
+    export class AccountDurableObject extends ProductionAccount {
+      async expireSeat(){const seat=await this.getActiveSeat();if(seat)await this.ctx.storage.put('activeSeat',{...seat,expiresAt:Date.now()-1});return seat||null;}
+    }
+    export {SiteDirectory,RoomDurableObject,AdmissionDurableObject,MatchArchive};
     const TOKENS = ${JSON.stringify(ACTORS)};
     export default {async fetch(request, env) {
       const url = new URL(request.url);
@@ -32,6 +36,12 @@ async function seatHarness(t) {
       }
       const input = await request.json();
       const token = TOKENS[input.actor] || TOKENS.a;
+      if (input.expireSeat) {
+        const site = env.SITES.get(env.SITES.idFromName('directory'));
+        const who = input.actor || 'a';
+        const user = await site.resolveGithubUser({ id: String(who).charCodeAt(0), login: 'Player ' + who, avatarUrl: null });
+        return Response.json(await env.ACCOUNTS.get(env.ACCOUNTS.idFromName(user.accountId)).expireSeat());
+      }
       if (input.seed) {
         const site = env.SITES.get(env.SITES.idFromName('directory'));
         const user = await site.resolveGithubUser({ id: String(input.actor || 'a').charCodeAt(0), login: 'Player ' + (input.actor || 'a'), avatarUrl: null });
@@ -177,4 +187,29 @@ test('giving up the seat also withdraws a join request the room already approved
     'the guest must be able to start a match of their own');
   c.ws.close();
   void connect;
+});
+
+// What a dropped connection between reserving a room and connecting to it leaves behind: the claim exists,
+// the room does not. The account is not playing anything, so it must not be told it has a match, and once
+// the claim's own lease is up the next attempt has to go through instead of being refused.
+test('a room that was reserved but never connected to is not a seat', { timeout: 90000 }, async (t) => {
+  const { h } = await seatHarness(t);
+  const reserved = await h.fetch({ path: '/api/rooms', method: 'POST' });
+  assert.equal(reserved.status, 201, await reserved.clone().text());
+  const route = await reserved.json();
+  // No socket is ever opened: this is the network dying between the two calls.
+
+  const pending = await h.fetch({ path: '/api/rooms', method: 'POST' });
+  assert.equal(pending.status, 409, 'inside the lease the attempt is still live');
+  const body = await pending.json();
+  assert.equal(body.error, 'SEAT_PENDING', 'a reservation must not be reported as a running match');
+  assert.ok(ACCOUNT_ERRORS[body.error], 'and it must be readable: ' + body.error);
+
+  // The claim lease is the client's deadline to finish connecting. Once it passes, the attempt is over.
+  await h.fetch({ expireSeat: true });
+  const next = await h.fetch({ path: '/api/rooms', method: 'POST' });
+  assert.equal(next.status, 201, 'an expired attempt must not keep refusing new starts: ' + await next.clone().text());
+  const nextRoute = await next.json();
+  assert.notEqual(nextRoute.code, route.code, 'a fresh room is a fresh code');
+  assert.equal((await (await h.fetch({ path: '/api/me/active-match' })).json()).activeSeat.roomId, nextRoute.code);
 });

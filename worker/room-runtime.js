@@ -236,11 +236,20 @@ export class RoomRuntime {
     this.reservation = { ticket, accountId, expiresAt: this.now() + ROOM_LIMITS.reservationMs };
     return ticket;
   }
-  hasAccount(accountId) {
-    return !!accountId && (this.reservation?.accountId === accountId ||
-      this.applications.list(accountId).some(x=>x.status==='approved') ||
-      [...this.registry.all()].some(s => s.accountId === accountId && this.lobby.roomOf(s)));
+  /**
+   * Why the room still counts this account, strongest first. A reservation is not a room: it only says the
+   * client asked for one and has not connected yet, which is exactly the state a dropped connection leaves
+   * behind. Callers that have to decide whether a seat is real need to tell that apart from a player who is
+   * actually here, so the reason is reported rather than only its existence.
+   */
+  presenceOf(accountId) {
+    if (!accountId) return null;
+    if ([...this.registry.all()].some(s => s.accountId === accountId && this.lobby.roomOf(s))) return 'connected';
+    if (this.applications.list(accountId).some(x=>x.status==='approved')) return 'approved';
+    if (this.reservation?.accountId === accountId) return 'reserved';
+    return null;
   }
+  hasAccount(accountId) { return !!this.presenceOf(accountId); }
   resumeAccount(accountId) {
     if (!this.hasAccount(accountId)) return null;
     if (this.reservation?.accountId===accountId) return this.reservation.ticket;

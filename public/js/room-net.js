@@ -243,7 +243,10 @@ export class RoomNet extends Net {
   async resumeActive() {
     const route=await accountRequest('/api/me/resume',{});
     if(!route?.code) throw new NetError('ROOM_NOT_FOUND','对局已结束或恢复时间已过');
-    if(route.reserved)throw new NetError('ROOM_NOT_FOUND','房间创建尚未完成，请等待预留过期后重新创建');
+    // The room never came into existence, so there is nothing to wait for and nothing to resume into.
+    // Clear the orphan instead of leaving the account waiting out a reservation for a game that is not
+    // running - the next press of start then works.
+    if(route.reserved){await this.releaseSeat().catch(()=>{});throw new NetError('ROOM_NOT_FOUND','上次预留的房间没有连接成功，已清理，请重新开始');}
     if(route.join)return this.joinApproved(route);
     await this._openRoute(route,null);
   }

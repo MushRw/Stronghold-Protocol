@@ -47,19 +47,27 @@ async function admit(env, ip, kind) {
  * room and never finished connecting (closed tab, refused upgrade, lost network) leaves a claim behind,
  * and because claims carry a lease that is never renewed, that dead claim would lock the account out of
  * every room from then on. So confirm with the room before refusing, and drop the claim when it is dead.
+ *
+ * The room's answer is graded, because "you asked for a room and never arrived" is not the same as
+ * "you are playing". Past the claim's own lease that attempt is over: holding the account on it would
+ * refuse every new start for up to another two minutes over a connection that is never coming, and the
+ * refusal reads as though a match were in progress. Within the lease the attempt is still live, so it is
+ * reported as pending rather than refused as seated.
  */
 async function liveSeat(env, session) {
   const account = accountOf(env, session.accountId);
   const seat = await account.getActiveSeat();
   if (!seat) return null;
-  let live = false;
+  let live = false, presence = null;
   try {
     const response = await roomStub(env, seat.roomId).fetch(new Request('https://room.internal/_account', {
       headers: { 'X-Account-ID': session.accountId, 'X-Room-Generation': seat.roomGeneration } }));
     live = response.ok;
+    if (live) presence = (await response.json()).presence;
   } catch { live = false; }
+  if (live && presence === 'reserved' && !(seat.expiresAt > Date.now())) live = false;
   if (!live) { await account.releaseSeat({ claimId: seat.claimId }); return null; }
-  return seat;
+  return presence === 'reserved' ? { ...seat, pending: true } : seat;
 }
 
 export default {
@@ -110,7 +118,8 @@ export default {
       if (gate.error) return error(gate.error.status, gate.error.code);
       const session = gate.session;
       if (session && request.headers.get('Origin') !== url.origin) return error(403, 'BAD_MSG');
-      if (session && await liveSeat(env, session)) return error(409, 'ALREADY_SEATED');
+      const held = session ? await liveSeat(env, session) : null;
+      if (held) return error(409, held.pending ? 'SEAT_PENDING' : 'ALREADY_SEATED');
       const limited = await admit(env, edgeIp(request), 'reserve');
       if (limited) return limited;
       for (let i = 0; i < 12; i++) {
@@ -469,7 +478,8 @@ export class RoomDurableObject {
           const ticket=rt.resumeAccount(accountId); await this.persistNow();
           return ticket ? json({code:rt.code,ticket,join:rt.applications.list(accountId).some(x=>x.status==='approved'),reserved:rt.reservation?.accountId===accountId}) : error(404,'ROOM_NOT_FOUND');
         }
-        return json({activeSeat:{roomId:rt.code,roomGeneration:rt.generation},status:rt.status()});
+        return json({activeSeat:{roomId:rt.code,roomGeneration:rt.generation},status:rt.status(),
+          presence:rt.presenceOf(accountId)});
       }
       // The account layer's escape hatch. A seat claim is only released when the room stops listing the
       // account, so anything the room still remembers - a session, a stale join approval, an unexpired
