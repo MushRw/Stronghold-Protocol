@@ -20,7 +20,7 @@
 //      (never from the export - that was a bug: comparing our file to itself reported false success)
 //
 // All subprocess calls are async: spawnSync fails with EBUSY in this project's tool sandbox.
-import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync, mkdtempSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync, mkdtempSync, statSync, renameSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
@@ -72,7 +72,14 @@ const inList = (list, p) => (list || []).some((x) => p === x || p.startsWith(x))
 const classify = (p) => (inList(policy.keep, p) ? 'keep' : inList(policy.follow, p) ? 'follow' : 'ignore');
 
 const outDir = outIndex >= 0 ? path.resolve(argv[outIndex + 1]) : path.join(os.tmpdir(), 'sp-sync', ref.replace(/[^A-Za-z0-9._-]/g, '_'));
-if (existsSync(outDir)) rmSync(outDir, { recursive: true, force: true });
+if (existsSync(outDir)) {
+  // Rename, do not delete. A recursive delete from Node is intercepted on Windows by the tool sandbox's
+  // safe-delete shim, which shells out to a trash helper that cannot spawn here, so rmSync throws.
+  // Keeping the previous run next to the new one is useful anyway.
+  const stale = `${outDir}.old-${Date.now()}`;
+  renameSync(outDir, stale);
+  console.log(`已有目录改名保留: ${stale}`);
+}
 mkdirSync(outDir, { recursive: true });
 
 // 1. upstream tree
@@ -80,19 +87,26 @@ const tarball = path.join(outDir, '.upstream.tar');
 const arc = await gitRaw('archive', '--format=tar', '-o', tarball, ref);
 if (arc.code !== 0) { console.error(`git archive 失败: ${arc.stderr.trim()}`); process.exit(2); }
 try {
-  await runAsync('tar', ['-xf', tarball, '-C', outDir]);
+  // Run tar *inside* the output directory with a relative archive name. Passing `-C <absolute path>`
+  // fails on Windows: GNU tar reads "E:/..." as host:path and stops with "Cannot connect to E:".
+  await runAsync('tar', ['-xf', '.upstream.tar'], { cwd: outDir });
 } catch (error) {
   console.error(`解包失败（需要 tar）: ${(error.stderr || error.message || '').trim()}`);
   process.exit(2);
 }
-rmSync(tarball, { force: true });
+try { rmSync(tarball, { force: true }); } catch { /* safe-delete shim refuses deletes here; scratch file */ }
 console.log(`上游 ${ref} 已导出到 ${outDir}`);
 
 // 2. everything of ours that upstream does not own: our modules, our tests, our build layer.
 //    Also the files we patched, so a `follow` file we edited but upstream did not keeps our edit.
 const wanted = new Set([...(manifest.owner || []), ...(manifest.patched || [])]);
 const tracked = (await git('ls-files', '-z')).split('\0').filter(Boolean);
-const ours = tracked.filter((f) => wanted.has(f) || inList(policy.keep, f));
+// Copy every file of ours that upstream does not have at all - BBleae's client modules and history
+// screens predate anything we ever touched, so "did we change it" is the wrong test - plus anything
+// we own or have patched. Without the first clause the export silently lost files such as
+// public/js/screens/history.js, which nothing else copies.
+const upstreamFiles = new Set((await git('ls-tree', '-r', '--name-only', ref)).split('\n').filter(Boolean));
+const ours = tracked.filter((f) => !upstreamFiles.has(f) || wanted.has(f) || inList(policy.keep, f));
 let copied = 0;
 let copyBytes = 0;
 const BATCH = 64;
@@ -141,7 +155,7 @@ try {
     }
   }
 } finally {
-  rmSync(tmp, { recursive: true, force: true });
+  try { rmSync(tmp, { recursive: true, force: true }); } catch { /* see above: harmless in the OS temp dir */ }
 }
 
 console.log('');

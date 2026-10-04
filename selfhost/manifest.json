@@ -109,6 +109,7 @@
       "tools/rules-version-guard.mjs",
       "tools/selfhost-check.mjs",
       "tools/selfhost-sync.mjs",
+      "server/data.js",
       "server/match/checkpoint.js",
       "server/match/recorder.js",
       "public/js/account.js",
@@ -150,7 +151,8 @@
       "THIRD-PARTY-NOTICES.md",
       "LICENSE",
       "package-lock.json"
-    ]
+    ],
+    "_keepNote": "policy.keep 里的文件同步时一律用我们的版本。server/data.js 是 2026-10-04 实测加进来的：上游把 node:fs 内联回 data.js，会让 Worker 打包撞上 build-worker 的 \"Node filesystem leaked into Worker bundle\" 守卫。"
   },
   "upstreamBase": {
     "commit": "2cb84bd",
