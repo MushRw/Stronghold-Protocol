@@ -15,7 +15,7 @@ test('the console script parses and wires every panel it renders', () => {
 
   // Each panel renders into an element that must exist, and every panel needs a loader that is called on
   // load - a section that never loads is the failure this catches.
-  for (const id of ['token', 'filter', 'list', 'reload', 'mstate', 'mmsg', 'muntil', 'mtoggle',
+  for (const id of ['token', 'filter', 'list', 'reload', 'mstate', 'mmsg', 'muntil', 'mtoggle', 'msave',
     'dstate', 'dlist', 'dreload', 'wstate', 'wlist', 'wreload']) {
     assert.ok(ADMIN_PAGE.includes('id="' + id + '"'), `missing #${id}`);
   }
@@ -30,6 +30,11 @@ test('the console script parses and wires every panel it renders', () => {
     assert.ok(script.includes(loader), `${loader} is never invoked`);
   }
   assert.ok(!script.includes('${'), 'the page is a String.raw template: an interpolation would run at import time');
+  // Rewording the announcement must not be able to move the switch, so the save has its own button and
+  // sends the message alone - the server keeps whatever enabled and until already are.
+  const saveNotice = (script.split('async function saveNotice')[1] || '').split('\nasync ')[0];
+  assert.match(saveNotice, /JSON\.stringify\(\{ message:/, 'saving the announcement must send the message');
+  assert.ok(!/\benabled\b|\buntil\b/.test(saveNotice), 'saveNotice must not touch the switch or the deadline');
 
   // Every panel once gated on "is the token box filled", which told somebody who had already logged in as
   // an operator that they still needed a token. Whether we are authenticated is what the server says, not

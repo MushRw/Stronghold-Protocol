@@ -89,8 +89,9 @@ const ADMIN_PAGE = String.raw`<!doctype html>
       <input id="mmsg" placeholder="维护公告（可选，访客会看到这句话）" maxlength="500">
       <input id="muntil" type="datetime-local" title="自动结束时间；留空表示一直维护到你手动关闭">
       <button id="mtoggle" disabled>进入维护</button>
+      <button id="msave" disabled title="只更新访客看到的那句话，不动开关、不动自动结束时间">保存公告</button>
     </div>
-    <p class="sub">进入维护后全站返回维护页（不影响在线对局的中途结算，但会拒绝新连接）。填了「自动结束」就到点自动恢复（最迟多 10 秒，开关有缓存）；留空则一直维护到手动关闭。开启状态下访问 <code>/?key=管理令牌</code> 可换到一张放行 cookie。</p>
+    <p class="sub">进入维护后全站返回维护页（不影响在线对局的中途结算，但会拒绝新连接）。公告可以单独保存，访客下次加载维护页就会看到，不必重开关。填了「自动结束」就到点自动恢复（最迟多 10 秒，开关有缓存）；留空则一直维护到手动关闭。开启状态下访问 <code>/?key=管理令牌</code> 可换到一张放行 cookie。</p>
   </section>
   <section>
     <div class="bar">
@@ -173,9 +174,11 @@ async function load() {
 async function loadMaint() {
   const state = el('mstate'), button = el('mtoggle');
   if (!authed()) {
-    state.textContent = '维护状态：未登录'; state.className = 'tag'; button.disabled = true; return;
+    state.textContent = '维护状态：未登录'; state.className = 'tag';
+    button.disabled = true; el('msave').disabled = true; return;
   }
   button.disabled = false;
+  el('msave').disabled = false;
   try {
     const { maintenance } = await call('/api/admin/maintenance');
     // An expired deadline is not "in maintenance": the guard stops blocking at that moment, so the button
@@ -193,6 +196,20 @@ async function loadMaint() {
   } catch (e) {
     state.textContent = '维护状态：读取失败'; state.className = 'tag rejected';
   }
+}
+// Saving the notice sends only the message field: the server keeps whatever the switch and the deadline
+// are, so editing the wording can neither take the site down nor cancel a scheduled recovery.
+async function saveNotice() {
+  const button = el('msave');
+  el('msg').textContent = '';
+  button.disabled = true;
+  try {
+    await call('/api/admin/maintenance', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ message: el('mmsg').value.trim() || null }) });
+    el('msg').textContent = '公告已保存，访客下次加载维护页就会看到'; el('msg').className = 'msg';
+  } catch (e) {
+    el('msg').textContent = '保存公告失败：' + friendlyError(e.message); el('msg').className = 'msg err';
+  } finally { button.disabled = false; }
 }
 async function toggleMaint() {
   const button = el('mtoggle');
@@ -362,6 +379,7 @@ async function doLogout() {
 el('reload').addEventListener('click', () => { load(); loadMaint(); loadDiag(); loadWrites(); });
 el('filter').addEventListener('change', load);
 el('mtoggle').addEventListener('click', toggleMaint);
+el('msave').addEventListener('click', saveNotice);
 el('dreload').addEventListener('click', loadDiag);
 el('wreload').addEventListener('click', loadWrites);
 el('dologin').addEventListener('click', doLogin);

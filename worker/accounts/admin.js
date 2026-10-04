@@ -105,10 +105,23 @@ async function flagBody(request) {
   try { parsed = JSON.parse(raw); } catch { throw new AccountError('INVALID_BODY'); }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new AccountError('INVALID_BODY');
   if (Object.keys(parsed).some((k) => !['enabled', 'message', 'until'].includes(k))) throw new AccountError('INVALID_BODY');
-  if (typeof parsed.enabled !== 'boolean') throw new AccountError('INVALID_BODY');
-  if (parsed.message != null && (typeof parsed.message !== 'string' || parsed.message.length > 500)) throw new AccountError('INVALID_BODY');
-  if (parsed.until != null && !Number.isSafeInteger(parsed.until)) throw new AccountError('INVALID_BODY');
-  return { enabled: parsed.enabled, message: parsed.message || null, until: parsed.until || null };
+  // Absent keys stay absent. Normalising them to null here used to turn "I did not say" into "I said
+  // nothing", which is why editing the announcement required re-sending the switch along with it - and
+  // why a script's bare `{ enabled: true }` wiped a deadline someone had set by hand.
+  const out = {};
+  if ('enabled' in parsed) {
+    if (typeof parsed.enabled !== 'boolean') throw new AccountError('INVALID_BODY');
+    out.enabled = parsed.enabled;
+  }
+  if ('message' in parsed) {
+    if (parsed.message != null && (typeof parsed.message !== 'string' || parsed.message.length > 500)) throw new AccountError('INVALID_BODY');
+    out.message = parsed.message || null;
+  }
+  if ('until' in parsed) {
+    if (parsed.until != null && !Number.isSafeInteger(parsed.until)) throw new AccountError('INVALID_BODY');
+    out.until = parsed.until || null;
+  }
+  return out;
 }
 export async function handleAdminRoutes(request, env) {
   const path = new URL(request.url).pathname;
@@ -184,8 +197,26 @@ export async function handleAdminRoutes(request, env) {
       if (request.method !== 'POST') return json({ error: 'METHOD' }, 405);
       requireOrigin(request);
       const input = await flagBody(request);
-      const state = await directory.setMaintenance({ enabled: input.enabled, message: input.message,
-        until: input.until, updatedAt: Date.now() });
+      // Keys the caller left out keep what is stored, so a request can change one thing without having to
+      // restate the rest. Two callers need this: the console saves the announcement on its own, and
+      // tools/deploy-safe.mjs sends `enabled` alone. Under the old reading, editing the notice was only
+      // possible as part of flipping the switch - and a script's bare `{ enabled: true }` would have
+      // silently cleared a deadline someone had set by hand.
+      const current = (await directory.maintenance()) || { enabled: false };
+      const sent = (key) => Object.prototype.hasOwnProperty.call(input, key);
+      // A deadline already in the past is dropped rather than preserved: carried into a new window it
+      // would end that window the instant it opened, which reads as "the switch does not work".
+      const stale = (value) => !Number.isSafeInteger(value) || value <= Date.now();
+      const state = await directory.setMaintenance({
+        enabled: typeof input.enabled === 'boolean' ? input.enabled : !!current.enabled,
+        message: sent('message')
+          ? (typeof input.message === 'string' && input.message.trim() ? input.message.trim().slice(0, 500) : null)
+          : (typeof current.message === 'string' ? current.message : null),
+        until: sent('until')
+          ? (Number.isSafeInteger(input.until) ? input.until : null)
+          : (stale(current.until) ? null : current.until),
+        updatedAt: Date.now(),
+      });
       return json({ maintenance: state });
     }
     if (path === '/api/admin/write-stats' && request.method === 'GET') {

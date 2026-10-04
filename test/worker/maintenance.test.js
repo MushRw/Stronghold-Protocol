@@ -265,3 +265,42 @@ test('an operator can log into the console while the site is down, and players s
     const after = await (await send('/api/admin/session', { cookie })).json();
     assert.equal(after.authenticated, false);
   });
+
+// The notice is the one part of the switch an operator wants to change while the switch itself stays put:
+// the site is already down and there is nothing to toggle. It used to be saveable only by turning
+// maintenance off and back on again, which is a bad thing to have to do in order to fix a typo.
+test('the maintenance notice can be reworded without touching the switch', { timeout: 120000 }, async (t) => {
+  const h = await harness();
+  t.after(() => h.dispose());
+  const post = (payload) => h.request(ORIGIN + '/api/admin/maintenance', {
+    method: 'POST',
+    headers: { 'X-Admin-Token': TOKEN, Origin: ORIGIN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  const deadline = Date.now() + 3600_000;
+  await post({ enabled: true, message: '正在升级数据库', until: deadline });
+  await h.restart();
+  assert.match(await (await get(h, '/')).text(), /正在升级数据库/);
+
+  // Only `message` is sent: the switch and the deadline have to survive it, since not touching them is
+  // the entire reason this request exists.
+  const saved = await (await post({ message: '预计 22:30 恢复' })).json();
+  assert.equal(saved.maintenance.enabled, true, 'a notice edit must not end maintenance');
+  assert.equal(saved.maintenance.message, '预计 22:30 恢复');
+  assert.equal(saved.maintenance.until, deadline, 'a notice edit must not cancel the scheduled recovery');
+  await h.restart();
+  const page = await (await get(h, '/')).text();
+  assert.match(page, /预计 22:30 恢复/);
+  assert.doesNotMatch(page, /正在升级数据库/);
+
+  // A bare `{ enabled: true }` is what tools/deploy-safe.mjs sends. A deadline left behind by an earlier
+  // window is in the past, and carrying it into a new one would end that window as soon as it opened -
+  // the switch would look broken.
+  await post({ enabled: false, until: Date.now() - 3600_000 });
+  const reopened = await (await post({ enabled: true })).json();
+  assert.equal(reopened.maintenance.enabled, true);
+  assert.equal(reopened.maintenance.until ?? null, null);
+  await h.restart();
+  assert.equal((await get(h, '/')).status, 503, 'a script opening maintenance must actually take the site down');
+});
