@@ -20,9 +20,12 @@ test('the console script parses and wires every panel it renders', () => {
     assert.ok(ADMIN_PAGE.includes('id="' + id + '"'), `missing #${id}`);
   }
   for (const endpoint of ['/api/admin/accounts', '/api/admin/review', '/api/admin/maintenance',
-    '/api/admin/diag', '/api/admin/write-stats']) {
+    '/api/admin/diag', '/api/admin/write-stats', '/api/admin/login', '/api/admin/logout']) {
     assert.ok(script.includes(endpoint), `the script never calls ${endpoint}`);
   }
+  // Login and logout must travel under /api/admin/, not /api/auth/: the maintenance guard lets the first
+  // through and eats the second, which leaves the console offering a login form that cannot log in.
+  assert.ok(!script.includes('/api/auth/login'), 'the console must not log in through the player route');
   for (const loader of ['load()', 'loadMaint()', 'loadDiag()', 'loadWrites()']) {
     assert.ok(script.includes(loader), `${loader} is never invoked`);
   }

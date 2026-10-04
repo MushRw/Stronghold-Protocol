@@ -72,11 +72,21 @@ export default {
     const maintenance = await maintenanceGuard(request, env);
     if (maintenance) return maintenance;
     if (path === '/admin') return adminConfigured(env) ? new Response(ADMIN_PAGE, { headers: adminPageHeaders() }) : error(404, 'NOT_FOUND');
-    if(env.ADMISSION && (path.startsWith('/api/auth/') || path==='/api/rooms' && request.method==='GET' || /\/applications$/.test(path))) {
-      const kind=path.startsWith('/api/auth/local')||path==='/api/auth/register'||path==='/api/auth/login'?'localauth'
+    // /api/admin/login is the ordinary login under a prefix the maintenance guard lets through, so it has
+    // to be metered like one - otherwise the console's front door doubles as an unmetered password guesser.
+    if(env.ADMISSION && (path.startsWith('/api/auth/') || path==='/api/admin/login' || path==='/api/rooms' && request.method==='GET' || /\/applications$/.test(path))) {
+      const kind=path.startsWith('/api/auth/local')||path==='/api/auth/register'||path==='/api/auth/login'||path==='/api/admin/login'?'localauth'
         :path.startsWith('/api/auth/')?'auth':request.method==='GET'?'status':'application';
       const limited=await admit(env,edgeIp(request),kind);
       if(limited)return limited;
+    }
+    // The console is served during maintenance, so the way into it has to be too. These are the ordinary
+    // login and logout, reachable under /api/admin/ - a prefix the guard always lets through. Players stay
+    // locked out: only somebody who deliberately opened the console uses them, and logging in still buys
+    // nothing but the console while the site is down.
+    if (path === '/api/admin/login' || path === '/api/admin/logout') {
+      const tail = path.slice('/api/admin/'.length);
+      return await handleAuth(new Request(new URL('/api/auth/' + tail, url).toString(), request), env);
     }
     const admin = await handleAdminRoutes(request, env);
     if (admin) return admin;

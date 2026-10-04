@@ -128,7 +128,7 @@ npm run rules:record
 - `GET /api/admin/maintenance` 读维护开关，`POST` body `{enabled, message?, until?}` 切换（都要 `X-Admin-Token`，页面按钮在 `/admin` 顶部）。
   - 打开后**全站返回 503 维护页**（`/admin`、`/api/admin/*`、`/healthz` 除外——开关必须留着才能关回来）。**不需要部署**，这是它存在的理由：部署会 evict 所有 DO、断掉进行中的对局。
   - **`until` 是真的会生效的截止时间**：到点后守卫不再拦截（判断在读取侧，`maintenance.js` 的 `maintenanceActive()`），所以到期**不产生任何写入**——`site_flags` 里的值仍然是 `enabled: true`，只是不再算数。页面会把这种状态显示成"已到期（站点已恢复）"，并给一个"进入维护"按钮，而不是"结束维护"。留空表示一直维护到手动关闭。
-  - 你在浏览器里访问一次 `/?key=<令牌>` 会换到一张 12 小时的 cookie，之后自己照常进站（令牌不再留在地址栏里）。
+  - 你在浏览器里访问一次 `/?key=<令牌>` 会换到一张 12 小时的 cookie，之后自己照常进站（令牌不再留在地址栏里）。**这只是"自己想进站看看"**——维护期间登录后台**不需要**它：后台的登录与登出走 `/api/admin/login`、`/api/admin/logout`，跟玩家用的 `/api/auth/login` 是同一套逻辑，只是挂在 `/api/admin/` 这个始终放行的前缀下。玩家那条路在维护期间仍然是 503，登录后也换不来任何东西。
   - 开关存在 SiteDirectory 的 `site_flags` 表，读取带 **10 秒 per-isolate 缓存**，切换/到期后最长 10 秒全网生效；目录读不到时**放行**（fail open），不让读开关本身成为故障源。
 - `GET /api/admin/write-stats`（头 `X-Admin-Token`）返回三块：最近 50 局、**按天的汇总**（`daily`，UTC 日界，与免费额度重置一致）、以及**今日额度**（`quota: {limit, day, rows, matches, percent}`）。`/admin` 页面把今日占用放在最上面。
   - 免费层的分析接口**不提供** `rowsWritten`，所以这是唯一能看到"一局到底写了多少行"的途径；每局结束时由房间上报一行，代价可忽略。

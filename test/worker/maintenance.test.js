@@ -10,16 +10,17 @@ import { maintenanceActive } from '../../worker/maintenance.js';
 // Filesystem-backed data loaders only resolve under the production build substitutions, so this runs
 // the same bundle the edge does — which is also what makes the maintenance gate worth testing at all.
 let buildPromise = null;
-function source() {
+function bundleFile() {
   buildPromise ??= (async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'sp-maintenance-'));
     const file = path.join(dir, 'worker.mjs').replaceAll('\\', '/');
     await bundleWorker({ outfile: file });
     process.on('exit', () => { rm(dir, { recursive: true, force: true }).catch(() => {}); });
-    return `export { default, RoomDurableObject, AdmissionDurableObject, SiteDirectory, AccountDurableObject, MatchArchive } from ${JSON.stringify(file)};`;
+    return file;
   })();
   return buildPromise;
 }
+const source = async () => `export { default, RoomDurableObject, AdmissionDurableObject, SiteDirectory, AccountDurableObject, MatchArchive } from ${JSON.stringify(await bundleFile())};`;
 
 const TOKEN = 'test-admin-token-0123456789abcdef';
 const ORIGIN = 'https://test.example';
@@ -184,3 +185,83 @@ test('an expired deadline serves the site while the flag still reads enabled', {
   await h.restart();
   assert.equal((await get(h, '/')).status, 503);
 });
+
+// Dispatching a fetch from Node drops a `cookie` header (it is a forbidden header name), which would make
+// this test silently prove nothing. So these requests are built inside the worker instead - the same
+// arrangement the admin-session tests use.
+const cookieHarness = async () => createAccountHarness(`import worker, { SiteDirectory, AccountDurableObject, RoomDurableObject, AdmissionDurableObject, MatchArchive } from ${JSON.stringify(await bundleFile())};
+  export { SiteDirectory, AccountDurableObject, RoomDurableObject, AdmissionDurableObject, MatchArchive };
+  export default { fetch: async (request, env) => {
+    const input = await request.json();
+    const headers = new Headers({ Origin: ${JSON.stringify(ORIGIN)}, ...(input.headers || {}) });
+    if (input.cookie) headers.set('cookie', input.cookie);
+    return worker.fetch(new Request(${JSON.stringify(ORIGIN)} + input.path, {
+      method: input.method || 'GET', headers,
+      body: input.body === undefined ? undefined : JSON.stringify(input.body) }), env);
+  } };`, {
+  bindings: { ADMIN_TOKEN: TOKEN },
+  durableObjects: {
+    SITES: { className: 'SiteDirectory', useSQLite: true },
+    ROOMS: { className: 'RoomDurableObject', useSQLite: true },
+    ACCOUNTS: { className: 'AccountDurableObject', useSQLite: true },
+    ADMISSION: { className: 'AdmissionDurableObject', useSQLite: true },
+    MATCH_ARCHIVES: { className: 'MatchArchive', useSQLite: true },
+  },
+});
+
+// The console is served during maintenance, so the way *into* it has to be too - otherwise the operator is
+// handed a login form that cannot log in. It must not become a hole in the gate: a session is not a
+// maintenance pass, and ordinary players stay locked out, login included.
+test('an operator can log into the console while the site is down, and players still cannot',
+  { timeout: 120000 }, async (t) => {
+    const h = await cookieHarness();
+    t.after(() => h.dispose());
+    const LOGIN = '博士', PASSWORD = 'a-long-enough-secret';
+    const send = (path, options = {}) => h.fetch({ path, method: options.method || 'GET',
+      headers: options.headers, cookie: options.cookie, body: options.body });
+    const post = (path, body, headers) => send(path, { method: 'POST', body,
+      headers: { 'Content-Type': 'application/json', ...(headers || {}) } });
+
+    // Registered and approved while the site is still up: going down must not be what blocks onboarding.
+    assert.equal((await post('/api/auth/register', { login: LOGIN, password: PASSWORD })).status, 201);
+    assert.equal((await post('/api/admin/review', { login: LOGIN, status: 'approved' },
+      { 'X-Admin-Token': TOKEN })).status, 200);
+
+    assert.equal((await post('/api/admin/maintenance', { enabled: true }, { 'X-Admin-Token': TOKEN })).status, 200);
+    await h.restart();
+
+    // A player logging in is exactly what maintenance is supposed to stop.
+    const player = await post('/api/auth/login', { login: LOGIN, password: PASSWORD });
+    assert.equal(player.status, 503);
+    assert.match(player.headers.get('content-type') || '', /text\/html/,
+      'a player must get the maintenance page, not a JSON error');
+
+    const consoleLogin = await post('/api/admin/login', { login: LOGIN, password: PASSWORD });
+    assert.equal(consoleLogin.status, 204, await consoleLogin.text());
+    const raw = consoleLogin.headers.get('set-cookie') || '';
+    assert.match(raw, /__Host-sp_session=[0-9a-f]{64}/);
+    const cookie = raw.split(';')[0];
+
+    // `authenticated` means "is an operator", so a valid session that is not on the list still reads false
+    // - which is why NOT_OPERATOR is its own code, and why the page can tell "log in" from "not on the
+    // list". The code is what proves the cookie arrived: without one it would say LOGIN_REQUIRED.
+    const who = await (await send('/api/admin/session', { cookie })).json();
+    assert.equal(who.code, 'NOT_OPERATOR', 'the session cookie must reach the server');
+    assert.equal(who.authenticated, false);
+    // Being logged in is not a maintenance pass: the site stays down for this session too.
+    assert.equal((await send('/', { cookie })).status, 503);
+
+    // Granting the seat is token-only, and it works while down - it is the bootstrap that has to.
+    assert.equal((await post('/api/admin/operators', { login: LOGIN, action: 'add' },
+      { 'X-Admin-Token': TOKEN })).status, 200);
+    const op = await (await send('/api/admin/session', { cookie })).json();
+    assert.equal(op.authenticated, true);
+    assert.equal(op.code, null);
+    assert.equal(op.via, 'session');
+    assert.equal(op.fresh, true);
+
+    // Logging out has to work for the same reason logging in does.
+    assert.equal((await send('/api/admin/logout', { method: 'POST', cookie })).status, 204);
+    const after = await (await send('/api/admin/session', { cookie })).json();
+    assert.equal(after.authenticated, false);
+  });

@@ -326,7 +326,7 @@ async function doLogin() {
   msg.textContent = ''; msg.className = 'msg';
   el('dologin').disabled = true;
   try {
-    const response = await fetch('/api/auth/login', { method: 'POST',
+    const response = await fetch('/api/admin/login', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ login: el('login').value.trim(), password: el('password').value }) });
     const body = await response.json().catch(() => ({}));
@@ -354,7 +354,7 @@ async function activate() {
 }
 async function doLogout() {
   el('logout').disabled = true;
-  try { await fetch('/api/auth/logout', { method: 'POST' }); } catch { /* the cookie is cleared either way */ }
+  try { await fetch('/api/admin/logout', { method: 'POST' }); } catch { /* the cookie is cleared either way */ }
   el('logout').disabled = false;
   await probe();
 }
