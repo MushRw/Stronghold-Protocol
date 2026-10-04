@@ -19,6 +19,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   input { flex:1 1 240px; min-width:0; }
   input[type=datetime-local] { flex:0 0 auto; max-width:190px; }
   h3 { font-size:13px; color:var(--muted); font-weight:600; margin:20px 0 8px; }
+  .muted { color:var(--muted); }
   button { cursor:pointer; } button:hover { border-color:var(--accent); }
   button.ok { color:var(--ok); } button.no { color:var(--no); }
   table { width:100%; border-collapse:collapse; background:var(--panel); border-radius:10px; overflow:hidden; }
@@ -171,18 +172,26 @@ async function loadDiag() {
   try {
     const { probes, sizes } = await call('/api/admin/diag');
     const clean = (value) => String(value).replace(/[<>&]/g, '');
-    const bad = Object.entries(probes || {}).filter(([, value]) => value !== 'ok');
-    state.textContent = '诊断：' + (bad.length ? bad.length + ' / ' + Object.keys(probes).length + ' 个对象异常' : '全部正常');
+    // Whether a probe passed is decided by the probe itself, not by matching its text: a probe that is
+    // expected to answer with an error (the archive id has no archive) is a healthy object, and reading
+    // that as a failure makes the panel cry wolf on every visit. (No backticks in this script: the page is
+    // one String.raw template, so a stray one would end it.)
+    const entries = Object.entries(probes || {});
+    const bad = entries.filter(([, value]) => !value?.ok);
+    state.textContent = '诊断：' + (bad.length ? bad.length + ' / ' + entries.length + ' 个对象异常' : '对象全部正常');
     state.className = 'tag ' + (bad.length ? 'rejected' : 'approved');
-    const probeRows = Object.entries(probes || {}).map(([name, value]) => '<tr><td>' + clean(name) + '</td><td>'
-      + (value === 'ok' ? '<span class="tag approved">ok</span>' : '<span class="tag rejected">' + clean(value) + '</span>')
+    const probeRows = entries.map(([name, value]) => '<tr><td>' + clean(name) + '</td><td>'
+      + (value?.ok
+        ? '<span class="tag approved">ok</span> <span class="muted">' + clean(value.detail || '') + '</span>'
+        : '<span class="tag rejected">' + clean(value?.detail || '失败') + '</span>')
       + '</td></tr>').join('');
     const sizesHtml = typeof sizes === 'string'
       ? '<p class="sub">表行数不可用：' + clean(sizes) + '</p>'
       : '<h3>表行数</h3><table><thead><tr><th>表</th><th>行数</th></tr></thead><tbody>'
         + Object.entries(sizes || {}).map(([name, count]) => '<tr><td>' + clean(name) + '</td><td>' + count + '</td></tr>').join('')
         + '</tbody></table>';
-    list.innerHTML = '<table><thead><tr><th>对象</th><th>探针</th></tr></thead><tbody>' + probeRows + '</tbody></table>' + sizesHtml;
+    list.innerHTML = '<table><thead><tr><th>对象</th><th>探针</th></tr></thead><tbody>' + probeRows + '</tbody></table>'
+      + '<p class="sub">探针只证明对象能应答（最便宜的读走一个来回），不是数据校验。</p>' + sizesHtml;
   } catch (e) {
     state.textContent = '诊断：读取失败'; state.className = 'tag rejected'; list.innerHTML = '';
   }

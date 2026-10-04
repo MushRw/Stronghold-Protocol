@@ -71,18 +71,28 @@ export async function handleAdminRoutes(request, env) {
     if (path === '/api/admin/diag' && request.method === 'GET') {
       // Operator diagnostics. A Durable Object isolate that is reset on wake fails every call, so the
       // first question is always *which* object: probe each one with the cheapest possible read.
-      const attempt = async (label, fn) => {
-        try { await fn(); return label + ': ok'; } catch (e) { return label + ': ' + (e?.message || e); }
+      //
+      // Results are structured, not pre-rendered strings. They used to be `"SITES: ok"`, and the console
+      // compared that to `'ok'`: every object was then reported as broken, and the label was printed twice.
+      // Deciding whether a probe passed belongs on this side, where the probe's intent is known.
+      const attempt = async (fn) => {
+        try { await fn(); return { ok: true, detail: 'ok' }; }
+        catch (e) { return { ok: false, detail: String(e?.code || e?.message || e) }; }
       };
       const probes = {};
       for (const [name, id] of [['SITES', env.SITES.idFromName('directory')], ['ACCOUNTS', env.ACCOUNTS.idFromName('diag-probe')]]) {
         const stub = env[name].get(id);
         probes[name] = name === 'SITES'
-          ? await attempt('SITES', () => stub.getSession('0'.repeat(64)))
-          : await attempt('ACCOUNTS', () => stub.getProfile());
+          ? await attempt(() => stub.getSession('0'.repeat(64)))
+          : await attempt(() => stub.getProfile());
       }
-      // No archive exists yet, so a read error here still proves the object is reachable.
-      probes.MATCH_ARCHIVES = await attempt('MATCH_ARCHIVES', () => env.MATCH_ARCHIVES.get(env.MATCH_ARCHIVES.idFromName('diag-probe')).read('diag-probe'));
+      // The probe id deliberately has no archive: ARCHIVE_NOT_READY is the *expected* answer and means the
+      // object answered at all, which is the only thing this probe asks. Reporting it as a failure would
+      // cry wolf on a healthy deployment - and would keep doing so, since the probe id never gains data.
+      const archive = await attempt(() => env.MATCH_ARCHIVES.get(env.MATCH_ARCHIVES.idFromName('diag-probe')).read('diag-probe'));
+      probes.MATCH_ARCHIVES = archive.detail.includes('ARCHIVE_NOT_READY')
+        ? { ok: true, detail: 'ok（探针房间本就没有存档，能这样回答即说明对象活着）' }
+        : archive;
       let sizes = null;
       try { sizes = await directory.diagnostics(); }
       catch (e) { sizes = 'unavailable: ' + (e?.message || e); }

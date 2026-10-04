@@ -112,6 +112,9 @@ npm run rules:record
 - `GET /api/admin/accounts?status=pending|approved|rejected|`（头 `X-Admin-Token`）列出账号。
 - `POST /api/admin/review` body `{login, status}` 批准或拒绝；**拒绝会立即删除该账号已有会话**。
 - `GET /api/admin/diag`（头 `X-Admin-Token`）逐个探活各 DO 并报告表行数；DO 被重置时这些调用会失败，这是判断"是不是 DO 挂了"的第一步。
+  - 返回的 `probes` 是**结构化**的：`{ [对象名]: { ok, detail } }`。**判断成败是服务端的责任** —— 早先它返回的是给人读的字符串（`"SITES: ok"`），页面拿它跟 `'ok'` 比较，结果把每个对象都报成异常，还把标签打印了两遍。
+  - **`MATCH_ARCHIVES` 探针的 `ARCHIVE_NOT_READY` 是健康答案**：探针用的是固定 id 且**故意不放存档**，所以"没有存档"这个错误恰恰证明对象回答了。任何**其它**错误才是真的信号（那才是被重置的 isolate）。把它当故障会在每次访问时误报，而且永远如此 —— 那个探针 id 永远不会有数据。
+  - 探针只证明**对象能应答**（一次最便宜的读走个来回），**不是数据校验**；表行数是另一块信息。
 - 该接口有令牌保护，因此会把内部错误原因放在 `detail` 字段里返回——公开接口（注册/登录）不会。
 - `GET /api/admin/maintenance` 读维护开关，`POST` body `{enabled, message?, until?}` 切换（都要 `X-Admin-Token`，页面按钮在 `/admin` 顶部）。
   - 打开后**全站返回 503 维护页**（`/admin`、`/api/admin/*`、`/healthz` 除外——开关必须留着才能关回来）。**不需要部署**，这是它存在的理由：部署会 evict 所有 DO、断掉进行中的对局。
