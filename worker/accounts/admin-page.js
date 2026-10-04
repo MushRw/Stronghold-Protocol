@@ -118,12 +118,25 @@ const tokenBox = el('token');
 // Remembered for convenience only; the token stays a break-glass path, and the day-to-day way in is a login.
 tokenBox.value = sessionStorage.getItem('sp_admin_token') || '';
 const STATUS = { pending:'待审核', approved:'已批准', rejected:'已拒绝' };
+// What the server last said about us. Every section gates on this, not on whether the token box is filled:
+// a login session is a credential of its own, and gating on the box made the console demand a token from
+// somebody who had already logged in as an operator.
+let auth = null;
+const authed = () => !!(auth && auth.authenticated);
+const tokenHeaders = () => (tokenBox.value.trim() ? { 'X-Admin-Token': tokenBox.value.trim() } : {});
+// Only one of the operator errors actually means "your token is wrong", and saying that to somebody who
+// logged in sends them hunting for a secret they were never supposed to need.
+const friendlyError = (code) => (code === 'FORBIDDEN' ? '凭据不被接受'
+  : code === 'NOT_OPERATOR' ? '这个账号不在操作员名单里'
+  : code === 'RELOGIN_REQUIRED' ? '登录已超过 12 小时，请重新登录后再做这个操作'
+  : code === 'LOGIN_REQUIRED' ? '请重新登录'
+  : code);
 const stamp = (ms) => ms ? new Date(ms).toLocaleString('zh-CN', { hour12:false }) : '—';
 // A datetime-local input speaks local wall-clock with no zone, so shift by the offset before slicing ISO.
 const toLocalInput = (ms) => new Date(ms - new Date(ms).getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 const utcDay = (day) => new Date(day * 86400000).toISOString().slice(0, 10);
 async function call(path, options = {}) {
-  const response = await fetch(path, { ...options, headers: { 'X-Admin-Token': tokenBox.value.trim(), ...(options.headers || {}) } });
+  const response = await fetch(path, { ...options, headers: { ...tokenHeaders(), ...(options.headers || {}) } });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || ('HTTP ' + response.status));
   return body;
@@ -137,7 +150,7 @@ async function review(login, status) {
 }
 async function load() {
   const list = el('list'), msg = el('msg');
-  if (!tokenBox.value.trim()) { list.innerHTML = '<div class="empty">先填管理令牌</div>'; return; }
+  if (!authed()) { list.innerHTML = '<div class="empty">未登录</div>'; return; }
   list.innerHTML = '<div class="empty">加载中…</div>';
   try {
     const { items } = await call('/api/admin/accounts?status=' + encodeURIComponent(el('filter').value));
@@ -153,14 +166,14 @@ async function load() {
     list.innerHTML = '<table><thead><tr><th>代号</th><th>状态</th><th>注册时间</th><th>审核时间</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
   } catch (e) {
     list.innerHTML = '<div class="empty">无法读取</div>';
-    msg.textContent = e.message === 'FORBIDDEN' ? '管理令牌不对' : e.message;
+    msg.textContent = friendlyError(e.message);
     msg.className = 'msg err';
   }
 }
 async function loadMaint() {
   const state = el('mstate'), button = el('mtoggle');
-  if (!tokenBox.value.trim()) {
-    state.textContent = '维护状态：先填管理令牌'; state.className = 'tag'; button.disabled = true; return;
+  if (!authed()) {
+    state.textContent = '维护状态：未登录'; state.className = 'tag'; button.disabled = true; return;
   }
   button.disabled = false;
   try {
@@ -198,13 +211,13 @@ async function toggleMaint() {
       body: JSON.stringify({ enabled: enter, message: el('mmsg').value.trim() || null, until: parsed }) });
     await loadMaint();
   } catch (e) {
-    el('msg').textContent = '维护开关失败：' + e.message; el('msg').className = 'msg err';
+    el('msg').textContent = '维护开关失败：' + friendlyError(e.message); el('msg').className = 'msg err';
   } finally { button.disabled = false; }
 }
 async function loadDiag() {
   const state = el('dstate'), list = el('dlist'), button = el('dreload');
-  if (!tokenBox.value.trim()) {
-    state.textContent = '诊断：先填管理令牌'; state.className = 'tag'; list.innerHTML = ''; button.disabled = true; return;
+  if (!authed()) {
+    state.textContent = '诊断：未登录'; state.className = 'tag'; list.innerHTML = ''; button.disabled = true; return;
   }
   button.disabled = false;
   list.innerHTML = '<div class="empty">加载中…</div>';
@@ -237,8 +250,8 @@ async function loadDiag() {
 }
 async function loadWrites() {
   const state = el('wstate'), list = el('wlist'), button = el('wreload');
-  if (!tokenBox.value.trim()) {
-    state.textContent = '写入量：先填管理令牌'; state.className = 'tag'; list.innerHTML = ''; button.disabled = true; return;
+  if (!authed()) {
+    state.textContent = '写入量：未登录'; state.className = 'tag'; list.innerHTML = ''; button.disabled = true; return;
   }
   button.disabled = false;
   try {
@@ -276,9 +289,8 @@ el('list').addEventListener('click', (event) => {
 // The console has three states and the server decides which: a login session (an identity, HttpOnly cookie,
 // revocable on its own), the ADMIN_TOKEN (break-glass, and the only way to grant the first operator seat),
 // or neither - in which case all this page offers is a login form.
-const TOKEN_HEADER = { 'X-Admin-Token': tokenBox.value.trim() };
 async function whoami() {
-  const response = await fetch('/api/admin/session', { headers: { ...TOKEN_HEADER } });
+  const response = await fetch('/api/admin/session', { headers: tokenHeaders() });
   return response.json();
 }
 function render(state) {
@@ -302,12 +314,12 @@ function render(state) {
   who.textContent = isToken
     ? '身份：管理令牌（脚本同款）'
     : '身份：' + (state.login || '操作员') + '（操作员' + (state.fresh ? '' : '，登录已超期') + '）';
-  if (isToken) return;
+  // The token is break-glass, so it has to be able to do everything a session can, not just hand out seats.
   load(); loadMaint(); loadDiag(); loadWrites();
 }
 async function probe() {
-  try { render(await whoami()); }
-  catch (e) { el('who').textContent = '身份：读取失败'; el('who').className = 'tag rejected'; }
+  try { auth = await whoami(); render(auth); }
+  catch (e) { auth = null; el('who').textContent = '身份：读取失败'; el('who').className = 'tag rejected'; }
 }
 async function doLogin() {
   const msg = el('loginmsg');
@@ -358,7 +370,6 @@ el('logout').addEventListener('click', doLogout);
 el('password').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
 tokenBox.addEventListener('input', () => {
   sessionStorage.setItem('sp_admin_token', tokenBox.value.trim());
-  TOKEN_HEADER['X-Admin-Token'] = tokenBox.value.trim();
   probe();
 });
 probe();

@@ -27,6 +27,13 @@ test('the console script parses and wires every panel it renders', () => {
     assert.ok(script.includes(loader), `${loader} is never invoked`);
   }
   assert.ok(!script.includes('${'), 'the page is a String.raw template: an interpolation would run at import time');
+
+  // Every panel once gated on "is the token box filled", which told somebody who had already logged in as
+  // an operator that they still needed a token. Whether we are authenticated is what the server says, not
+  // what the box happens to hold - the token is a break-glass path, not the definition of a credential.
+  assert.ok(!/if\s*\(!tokenBox\.value/.test(script),
+    'a panel must not gate on the token box: a login session is a credential of its own');
+  assert.ok(/const authed\s*=/.test(script), 'the panels must gate on the authentication state');
 });
 
 test('GET /admin is served as HTML with a token gate', { timeout: 180000 }, async (t) => {
