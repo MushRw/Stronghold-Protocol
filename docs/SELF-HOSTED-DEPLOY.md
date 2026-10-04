@@ -97,6 +97,10 @@ npm run rules:record
   - 打开后**全站返回 503 维护页**（`/admin`、`/api/admin/*`、`/healthz` 除外——开关必须留着才能关回来）。**不需要部署**，这是它存在的理由：部署会 evict 所有 DO、断掉进行中的对局。
   - 你在浏览器里访问一次 `/?key=<令牌>` 会换到一张 12 小时的 cookie，之后自己照常进站（令牌不再留在地址栏里）。
   - 开关存在 SiteDirectory 的 `site_flags` 表，读取带 **10 秒 per-isolate 缓存**，切换后最长 10 秒全网生效；目录读不到时**放行**（fail open），不让读开关本身成为故障源。
+- `GET /api/admin/write-stats`（头 `X-Admin-Token`）返回最近 50 局的 **rows written 实际值**（`/admin` 页面有表格：房间、写入行数、flush 次数、时长）。
+  - 免费层的分析接口**不提供** `rowsWritten`，所以这是唯一能看到"一局到底写了多少行"的途径；每局结束时由房间上报一行，代价可忽略。
+  - 对局中也能看实时值：房间 `/_status` 的返回里带 `writes: {rows, flushes, since}`（需要房间码）。
+  - 用途：任何持久化改动（分块大小、节流、批量）的效果，都靠这张表验证，别再用推算。
 
 ## 出错时的自查顺序
 
@@ -129,3 +133,5 @@ fetch('/api/admin/diag',{headers:{'X-Admin-Token':'<你的令牌>'}}).then(r=>r.
 - **所有 DO 被重置**：包内嵌了 10 个历史规则引擎（58 MiB），改为默认不嵌 + 24 MiB 护栏。
 - **账号被永久锁死**：`/api/rooms` 记的座位租约从不续期，而 `getActiveSeat()` 不看 `expiresAt`；客户端建房后若没连上，座位永久残留，之后每次都 409。现改为建房前**向房间核实**该账号是否真的还在（去问 `/_account`，房间不存在或已不含该账号则释放席位）。注意不能简单地让 `getActiveSeat()` 遵守 `expiresAt`：座位上游戏时不会续期，那样会让坐着的玩家被判定过期、进而开出第二个房间。
 - **首页绕不过维护页**：`assets.run_worker_first` 原本只列 `/api/*`、`/ws`、`/healthz`、`/admin`，首页 HTML 由静态资源直出，任何 Worker 层的开关都拦不住它；现已加入 `/` 与 `/index.html`。`test/worker/maintenance.test.js` 里有配置契约断言守着这条，改配置时会被测试拦下。
+- **写入失败会把对局冻死**：`alarm()` 里 `await this.persist()` 没有 try/catch，一次写入抛错（额度耗尽、存储抖动）就跳过下面的 `scheduleAlarm()`；而 alarm 链是唯一会唤醒房间的东西，客户端消息又撞上同一个失败的写入，于是对局永久卡住 —— 这大概率就是上次超限那天故障特别严重的原因。现在 flush 有守卫、重排**一定**执行：降级而不是死掉。
+- **`setAlarm()` 每次 persist 都重排**：它本身按一行写入计费，对局中等于每条客户端消息白烧一行（而 `alarm()` 3 秒后本来就会自己重排）。现改为只在"期限真的提前"时才排，内存里记住已排时间，DO 被 evict 后回退 `getAlarm()`。
