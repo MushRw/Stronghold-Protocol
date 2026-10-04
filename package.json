@@ -41,7 +41,9 @@
     "resources:pack": "node tools/resource-pack.mjs",
     "resources:zip": "node tools/vendor.mjs && node tools/fetch-assets.mjs && node tools/resource-pack.mjs --out=.",
     "rules:check": "node tools/rules-version-guard.mjs check",
-    "rules:record": "node tools/rules-version-guard.mjs record"
+    "rules:record": "node tools/rules-version-guard.mjs record",
+    "selfhost:check": "node tools/selfhost-check.mjs",
+    "selfhost:sync": "node tools/selfhost-sync.mjs"
   },
   "engines": {
     "node": ">=22"
