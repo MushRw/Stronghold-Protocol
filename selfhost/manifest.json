@@ -50,6 +50,7 @@
     "test/worker/large-snapshot.test.js",
     "test/worker/local-auth.test.js",
     "test/worker/maintenance.test.js",
+    "test/worker/session-cache.test.js",
     "test/worker/spectators.test.js",
     "test/worker/versions.test.js",
     "test/worker/write-stats.test.js",
@@ -69,6 +70,7 @@
     "worker/room-runtime.js",
     "worker/rooms/spectators.js",
     "worker/storage/event-rows.js",
+    "worker/storage/session-cache.js",
     "wrangler.jsonc"
   ],
   "patched": [

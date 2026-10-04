@@ -14,6 +14,7 @@ import { handleHistoryRoutes } from './archive/routes.js';
 import { publishArchive,prepareArchive } from './archive/outbox.js';
 import { handleBackupRoutes } from './storage/backup.js';
 import { eventRows } from './storage/event-rows.js';
+import { cachedVerdict, rememberVerdict } from './storage/session-cache.js';
 import { maintenanceGuard } from './maintenance.js';
 
 // the deployed commit (tools/build-worker.mjs buildId; esbuild defines it, unbundled tests see 'local')
@@ -206,6 +207,11 @@ export class RoomDurableObject {
     this.alarmAt = null;
     this.lastInMatch = false;      // edge-detects a match ending, so its cost can be reported once
     this.writes = { rows: 0, flushes: 0, since: Date.now() };
+    // Session verdicts, so the per-message check does not hit the site directory every time (see
+    // ./storage/session-cache.js). In-memory on purpose: persisting it would cost a row written per
+    // refresh and still need a round trip, which is the thing being avoided.
+    this.sessionCache = new Map();
+    this.sessionChecks = { calls: 0, cached: 0 };
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping","c":0}', '{"t":"pong","c":0}'));
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const meta = await ctx.storage.get('snapshot-meta');
@@ -465,7 +471,7 @@ export class RoomDurableObject {
       if (url.pathname === '/_diag' && request.method === 'GET') {
         const status = rt.status();
         if (!status) return error(404, 'ROOM_NOT_FOUND');
-        return json({ ...status, writes: this.writes, parts: this.parts });
+        return json({ ...status, writes: this.writes, parts: this.parts, sessionChecks: this.sessionChecks });
       }
       if (url.pathname !== '/_ws' || request.method !== 'GET') return error(404, 'BAD_MSG');
       if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return error(426, 'BAD_MSG');
@@ -485,12 +491,27 @@ export class RoomDurableObject {
       return new Response(null, { status: 101, webSocket: client });
     });
   }
+  /**
+   * Whether this session may keep sending, reused for a few seconds at a time.
+   *
+   * This is the room's only per-message cross-object round trip, and it is billed as a Durable Object
+   * request on the same free-tier budget as the messages themselves, so a 1 Hz client report used to cost
+   * two requests a second instead of one. The verdict only changes when someone logs out or is rejected
+   * by the review gate, so remembering it briefly is nearly free - but only a valid verdict is cached, and
+   * never past the session's own expiry (see ./storage/session-cache.js).
+   */
+  async sessionValid(sessionId, accountId) {
+    const now = Date.now();
+    if (cachedVerdict(this.sessionCache, sessionId, accountId, now)) { this.sessionChecks.cached++; return true; }
+    this.sessionChecks.calls++;
+    const session = await directoryOf(this.env).getSession(sessionId);
+    return rememberVerdict(this.sessionCache, sessionId, accountId, session, now);
+  }
   async webSocketMessage(ws, message) {
     await this.ready;
     if (this.env.ACCOUNTS) {
       const adapter=this.sockets.get(ws), meta=adapter && this.runtime.socketMeta.get(adapter);
-      const session=meta?.sessionId && await directoryOf(this.env).getSession(meta.sessionId);
-      if (!session || session.accountId!==meta.accountId || session.expiresAt<=Date.now()) { adapter?.close(4003,'login required'); return; }
+      if (!meta?.sessionId || !await this.sessionValid(meta.sessionId, meta.accountId)) { adapter?.close(4003,'login required'); return; }
     }
     return this.ctx.blockConcurrencyWhile(async () => {
       const adapter = this.sockets.get(ws);
