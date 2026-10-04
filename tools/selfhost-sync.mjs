@@ -26,6 +26,7 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { applyWorkerPatches } from './selfhost-patches.mjs';
 
 const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -158,10 +159,15 @@ try {
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* see above: harmless in the OS temp dir */ }
 }
 
+// Worker-specific patches: upstream ships a Node server, so a couple of its choices have to be
+// undone for a Durable Object. Fails loudly rather than skipping (see ./selfhost-patches.mjs).
+const patched = applyWorkerPatches(outDir);
+
 console.log('');
 console.log(`基线              ${BASE.slice(0, 8)}（上游 ${ref} 相对它改了 ${changed.length} 个文件）`);
 console.log(`follow 自动合并    ${stats.merged.length} 个`);
 console.log(`follow 需人工      ${stats.conflicts.length} 个`);
+console.log(`Worker 适配 patch  ${patched.results.filter((r) => r.status === 'applied').length} 应用 / ${patched.failed.length} 待人工`);
 console.log(`上游独有（未覆盖） ${stats.upstreamOnly} 个`);
 for (const c of stats.conflicts) {
   console.log(`      ${c.path}  ${c.hunks} 处冲突  ->  ${path.join(outDir, c.path)}.conflict`);

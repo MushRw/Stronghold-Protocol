@@ -81,3 +81,38 @@ npm run selfhost:sync -- v0.1.2 --fetch        # 目标可以是 tag，也可以
 - **不要试图 `git merge upstream/master`**，它会把两条无关历史搅在一起，产生成百上千个假冲突。
 - **不要同步上游的 `test/`（100+ 文件）和 `tools/`（12 个文件）**，除非你真的需要：它们与自托管层无关，只会让每次同步都要重新解一堆冲突，而我们的 CI 是关的、本机 miniflare 全量套件也跑不完。
 - **不要把 `dist/`、`.cache/`、`node_modules/` 混进清单** —— 那是构建产物。
+
+## 同步一次的实际流程（2026-10-04 实测跑通）
+
+```bash
+npm run selfhost:sync -- sgangss/master --out E:/tmp/sp-sync    # 约 1.5~4 分钟
+```
+
+脚本依次做：导出上游树 → 铺上我方文件（**上游没有的都要**，外加 owner/patched/keep）→ follow 范围三方合并 → **应用 Worker 适配 patch** → 报告统计。
+
+**每次都会出现的 4 处冲突**（性质已逐条确认，照抄处置即可）：
+
+| 文件 | 取哪边 | 为什么 |
+|---|---|---|
+| `data/assets.json` | **ours** | 资源清单与 405 MB 资源包绑定 |
+| `public/dev/game-mock.js` | theirs | 开发用 mock，我们没定制过 |
+| `public/js/screens/loadout.js` | theirs | 含上游对 issue #64（局内数值）的修复 |
+| `public/js/ui/shopBar.js` | theirs | 上游新功能（offerHeader / briefingBondTip） |
+
+后三个我们**从未改过** —— 冲突里的 ours 侧只是旧快照，不是定制。
+
+**两类必须保住的东西**（脚本自动处理，但要知道原因）：
+
+1. **`server/data.js` 在 `policy.keep`**：上游会把 `node:fs` 内联回它，Worker 打包会撞 `Node filesystem leaked into Worker bundle` 守卫。
+2. **`server/net.js` 靠 patch 补回 `autoTimers` 守卫**：上游的 net.js 无条件起 `setInterval`，会让 Durable Object 无法休眠（持续计费）也无法 evict（miniflare 会报 "still has active references"）。`tools/selfhost-patches.mjs` 负责重新加上；**上游若改了那段结构，patch 会报「待人工」而不是静默跳过**。
+
+**验证产物**（别跳过）：
+
+```bash
+bash selfhost/verify-sync.sh     # 一键：复制到仓库内 .align-check/ + 接 node_modules + 跑打包与套件
+```
+
+判定标准：测试 `# fail 0` 且打包通过。2026-10-04 的对照是：patch 前 **64/66**（两个失败同源于 net.js），patch 后 **66/66**。
+
+> 产物必须复制到**仓库内**的子目录（`.align-check/`，已加 `.git/info/exclude`）—— 放在仓库外时 Node 的 `node_modules` 解析找不到依赖，构建的 vendor 步骤会 `ENOENT`。
+
