@@ -9,7 +9,8 @@
   },
   "snapshot": {
     "commit": "056a1ca",
-    "description": "我们的根提交（BBleae 导入的快照）。不是上游的提交，也不能当合并基线用——它与上游最接近的版本仍差 1 万余行。"
+    "description": "我们的根提交（BBleae 导入的快照）。不是上游的提交，也不能当合并基线用——它与上游最接近的版本仍差 1 万余行。",
+    "warning": "不要用它当合并基线（见 upstreamBase.why），它只用于识别\"我们改过哪些文件\"。"
   },
   "owner": [
     ".gitignore",
@@ -86,5 +87,70 @@
     "public/js/screens/room.js",
     "public/js/screens/title.js"
   ],
-  "_hotspotsNote": "2026-10-04 实测（以快照 056a1ca 为基线做三方合并）：14 个 patched 里 11 个能自动干净应用，只有这 3 个需要人工，冲突块分别 1 / 1 / 2 处。注意 server/match/Match.js 与 shared/protocol.js 虽然上游也在改（37 行 / 28 行），但改动区域与我们的不重叠，仍能自动合并——所以'上游改过'不等于'会冲突'。要重测：npm run selfhost:sync -- <ref>，或看计划文档里的实测命令。"
+  "_hotspotsNote": "2026-10-04 实测（以快照 056a1ca 为基线做三方合并）：14 个 patched 里 11 个能自动干净应用，只有这 3 个需要人工，冲突块分别 1 / 1 / 2 处。注意 server/match/Match.js 与 shared/protocol.js 虽然上游也在改（37 行 / 28 行），但改动区域与我们的不重叠，仍能自动合并——所以'上游改过'不等于'会冲突'。要重测：npm run selfhost:sync -- <ref>，或看计划文档里的实测命令。",
+  "policy": {
+    "_note": "同步策略（优先级 keep > follow > ignore）。why：我们是 BBleae 的 Cloudflare Workers 版 fork，上游 sgangss 是纯 Node 版且明确表示 fork 各自维护（PR #34）。所以只同步『游戏本体』，不同步 Node 运行时/上游测试/上游开发工具。",
+    "_rules": {
+      "keep": "永远用我们的版本，不被上游覆盖（自托管层 + 我们的客户端模块 + 我们的测试/文档）",
+      "follow": "用三方合并把上游改动并进来（游戏引擎、内容数据、客户端 UI、被 worker 依赖的服务端模块）",
+      "ignore": "完全不动（Node 运行时、上游测试、上游开发工具、上游文档）"
+    },
+    "keep": [
+      "worker/",
+      "selfhost/",
+      "wrangler.jsonc",
+      "replay-versions/",
+      "replay-versions.json",
+      "tools/build-worker.mjs",
+      "tools/rules-version-guard.mjs",
+      "tools/selfhost-check.mjs",
+      "tools/selfhost-sync.mjs",
+      "server/match/checkpoint.js",
+      "server/match/recorder.js",
+      "public/js/account.js",
+      "public/js/room-net.js",
+      "public/js/ui/accountMenu.js",
+      "public/js/ui/localAuth.js",
+      "public/js/resources/index.js",
+      "public/js/resources/view.js",
+      "test/worker/",
+      "test/ui/spectators.e2e.test.js",
+      "test/account-client.test.js",
+      "test/resources/browser.e2e.test.js",
+      "docs/SELF-HOSTED-DEPLOY.md",
+      "docs/ACCOUNTS-HISTORY.md",
+      "docs/CLOUDFLARE.md",
+      ".gitignore",
+      "package.json"
+    ],
+    "follow": [
+      "server/sim/",
+      "server/match/",
+      "server/lobby.js",
+      "server/net.js",
+      "shared/",
+      "data/",
+      "public/"
+    ],
+    "ignore": [
+      "test/",
+      "docs/",
+      "scripts/",
+      "tools/",
+      "Dockerfile",
+      ".dockerignore",
+      ".github/",
+      "README.md",
+      "CHANGELOG.md",
+      "NOTICE.md",
+      "THIRD-PARTY-NOTICES.md",
+      "LICENSE",
+      "package-lock.json"
+    ]
+  },
+  "upstreamBase": {
+    "commit": "2cb84bd",
+    "at": "2026-10-03T01:36Z",
+    "why": "三方合并的 base 必须是上游的提交，不能是我们的快照。我们的快照 056a1ca（02:13 UTC）里带着上游从来没有的自托管内容（登录 UI、干员语音、Cloudflare 脚本），拿它当 base 会把『我们有、上游没有』误判成『上游删了它』，产出语法都坏的合并结果。2cb84bd 是上游在快照时刻之前最后一个提交（上游 01:36~02:20 UTC 之间没有提交）。"
+  }
 }

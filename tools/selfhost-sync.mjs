@@ -1,23 +1,19 @@
 #!/usr/bin/env node
-// Lay this project's self-hosted layer over an upstream revision, so syncing upstream stops being an
-// archaeology exercise.
+// Lay this project's game content on top of an upstream revision, driven by selfhost/manifest.json.
 //
-// Why this exists: our history and upstream's share no ancestor (0 common commits), so `git merge` is
-// meaningless here and "N commits behind" is a false number. What actually differs is small and
-// enumerable — selfhost/manifest.json lists it:
+// Why this exists: this repo is BBleae's Cloudflare Workers port of the game; upstream sgangss publishes
+// a plain Node server and has said (PR #34) that each fork maintains itself. Our history and theirs share
+// no ancestor (0 common commits), so `git merge` is meaningless and "N commits behind" is a false number.
+// What differs is small and enumerable, and the manifest enumerates it:
 //
-//   owner/    files that exist only here. Syncing = copying them over upstream's tree, verbatim.
-//   patched/  upstream files we edited. Syncing = re-applying our edit onto upstream's copy.
-//
-// For patched files the script runs a three-way merge using our snapshot commit as the base. When
-// upstream never touched the file, base and theirs are identical and our edit applies cleanly; when
-// upstream did touch it, you get a conflict to resolve by hand. That is why the manifest separates
-// `hotspots`: after a sync, only the hotspot conflicts need real thought.
+//   policy.keep    ours, never overwritten        (the Workers layer, our client modules, our tests)
+//   policy.follow  three-way merged from upstream (engine, data, client UI, shared modules)
+//   policy.ignore  left exactly as it is          (Node runtime, upstream tests/tools/docs)
+//   upstreamBase   the upstream commit to merge against - NOT our snapshot; see the note in the manifest.
 //
 // Usage:
-//   node tools/selfhost-sync.mjs                      # against sgangss/master, into a temp dir
-//   node tools/selfhost-sync.mjs v0.1.2               # against a tag
-//   node tools/selfhost-sync.mjs sgangss/master --out E:/sp-sync --fetch
+//   node tools/selfhost-sync.mjs                      # sgangss/master, into a temp dir
+//   node tools/selfhost-sync.mjs v0.1.2 --out E:/sp-sync --fetch
 import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
@@ -25,15 +21,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const argv = process.argv.slice(2);
-const flags = new Set(argv.filter((a) => a.startsWith('--')));
-const outIndex = argv.indexOf('--out');
-const ref = argv.find((a) => !a.startsWith('--') && argv[outIndex + 1] !== a) || 'sgangss/master';
-
-const run = (cmd, args, opts = {}) => {
-  const out = spawnSync(cmd, args, { cwd: root, encoding: 'utf8', ...opts });
-  return out;
-};
+const run = (cmd, args, opts = {}) => spawnSync(cmd, args, { cwd: root, encoding: 'utf8', ...opts });
 const gitOut = (...args) => {
   const out = run('git', args);
   if (out.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${out.stderr?.trim()}`);
@@ -41,28 +29,33 @@ const gitOut = (...args) => {
 };
 const gitOk = (...args) => run('git', args, { stdio: 'ignore' }).status === 0;
 
-if (flags.has('--fetch')) {
-  console.log('fetch ' + ref.split('/')[0] + '…');
-  run('git', ['-c', 'http.sslVerify=false', 'fetch', ref.split('/')[0]]);
-}
-if (!gitOk('cat-file', '-e', ref)) {
-  console.error(`找不到 ref: ${ref}。先跑 node tools/selfhost-sync.mjs --fetch`);
-  process.exit(2);
-}
-
 const manifest = JSON.parse(readFileSync(path.join(root, 'selfhost/manifest.json'), 'utf8'));
-const snapshot = manifest.snapshot?.commit;
-if (!snapshot || !gitOk('cat-file', '-e', snapshot)) {
-  console.error(`manifest.snapshot.commit 无效: ${snapshot}`);
-  process.exit(2);
+const argv = process.argv.slice(2);
+const flags = new Set(argv.filter((a) => a.startsWith('--')));
+const outIndex = argv.indexOf('--out');
+const ref = argv.find((a) => !a.startsWith('--') && argv[outIndex + 1] !== a)
+  || (manifest.upstream?.remote || 'sgangss') + '/master';
+
+if (flags.has('--fetch')) {
+  const remote = ref.split('/')[0];
+  console.log(`fetch ${remote}...`);
+  run('git', ['-c', 'http.sslVerify=false', 'fetch', remote]);
 }
+if (!gitOk('cat-file', '-e', ref)) { console.error(`找不到 ref: ${ref}`); process.exit(2); }
+const BASE = manifest.upstreamBase?.commit;
+if (!BASE || !gitOk('cat-file', '-e', BASE)) { console.error(`找不到合并基线: ${BASE}`); process.exit(2); }
+
+const policy = manifest.policy || {};
+const inList = (list, p) => (list || []).some((x) => p === x || p.startsWith(x));
+// keep beats follow beats ignore: an upstream directory rule must never overwrite the Workers layer
+// (server/match/ is followed, but server/match/checkpoint.js is ours).
+const classify = (p) => (inList(policy.keep, p) ? 'keep' : inList(policy.follow, p) ? 'follow' : 'ignore');
 
 const slug = ref.replace(/[^A-Za-z0-9._-]/g, '_');
 const outDir = outIndex >= 0 ? path.resolve(argv[outIndex + 1]) : path.join(os.tmpdir(), 'sp-sync', slug);
 if (existsSync(outDir)) rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
-// Export upstream's tree. `git archive` keeps this repository's own state untouched, unlike a worktree.
 const tarball = path.join(outDir, '.upstream.tar');
 const arc = run('git', ['archive', '--format=tar', '-o', tarball, ref]);
 if (arc.status !== 0) { console.error(`git archive 失败: ${arc.stderr?.trim()}`); process.exit(2); }
@@ -71,71 +64,71 @@ if (untar.status !== 0) { console.error(`解包失败（需要 tar）: ${untar.s
 rmSync(tarball, { force: true });
 console.log(`上游 ${ref} 已导出到 ${outDir}`);
 
-const report = { copied: 0, merged: [], conflicts: [], missing: [] };
-
-// owner: purely ours, so just install the file. Includes binaries (replay-versions/*.gz).
-for (const rel of manifest.owner || []) {
+const installOurs = (rel) => {
   const from = path.join(root, rel);
-  if (!existsSync(from)) { report.missing.push(rel); continue; }
+  if (!existsSync(from)) return false;
   const to = path.join(outDir, rel);
   mkdirSync(path.dirname(to), { recursive: true });
   copyFileSync(from, to);
-  report.copied += 1;
-}
+  return true;
+};
 
-// patched: replay our edit on top of upstream's copy with our snapshot as the merge base.
+const stats = { kept: 0, merged: [], conflicts: [], upstreamOnly: 0, missing: [] };
+
+// Only files upstream actually changed since the base are in scope; everything else is already right.
+const changed = gitOut('diff', '--name-only', BASE, ref).split('\n').filter(Boolean);
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'sp-sync-base-'));
 try {
-  for (const rel of manifest.patched || []) {
+  for (const rel of changed) {
+    const kind = classify(rel);
+    if (kind === 'keep' || kind === 'ignore') {
+      // Both mean "our copy stays". Upstream-only files in an ignored path (a new upstream test, say)
+      // are simply left in place - deleting them would be a guess, and they cost nothing.
+      if (installOurs(rel)) stats.kept += 1;
+      else stats.upstreamOnly += 1;
+      continue;
+    }
     const theirs = path.join(outDir, rel);
     const ours = path.join(root, rel);
-    if (!existsSync(theirs)) { report.missing.push(`(上游已无此文件) ${rel}`); continue; }
-    if (!existsSync(ours)) { report.missing.push(rel); continue; }
-    const base = path.join(tmp, 'base');
-    const baseBlob = run('git', ['show', `${snapshot}:${rel}`]);
-    if (baseBlob.status !== 0) { report.missing.push(`(快照里没有) ${rel}`); continue; }
-    writeFileSync(base, baseBlob.stdout);
-
+    if (!existsSync(theirs)) { stats.upstreamOnly += 1; continue; }
+    if (!existsSync(ours)) { stats.missing.push(rel); continue; }
+    const blob = run('git', ['show', `${BASE}:${rel}`]);
+    if (blob.status !== 0) { stats.missing.push(`${rel}（基线无此文件，保留上游版本）`); continue; }
+    const baseFile = path.join(tmp, 'base');
+    writeFileSync(baseFile, blob.stdout);
     const result = run('git', ['merge-file', '-p', '--diff3',
-      '-L', 'ours(selfhost)', '-L', `base(${snapshot.slice(0, 8)})`, '-L', 'theirs(upstream)',
-      ours, base, theirs]);
-    // Exit status is the number of conflicts (0 = clean, negative/>=128 = error).
-    const conflicts = result.status;
-    if (conflicts > 0) {
+      '-L', 'ours(selfhost)', '-L', `base(${BASE.slice(0, 8)})`, '-L', 'theirs(upstream)',
+      ours, baseFile, theirs]);
+    if (result.status > 0) {
       writeFileSync(theirs + '.conflict', result.stdout);
-      report.conflicts.push({ path: rel, hunks: conflicts });
-    } else if (conflicts === 0) {
+      stats.conflicts.push({ path: rel, hunks: result.status });
+    } else if (result.status === 0) {
       writeFileSync(theirs, result.stdout);
-      report.merged.push(rel);
+      stats.merged.push(rel);
     } else {
-      report.missing.push(`${rel} (merge-file 出错: ${result.stderr?.trim()})`);
+      stats.missing.push(`${rel}（merge-file 出错: ${result.stderr?.trim()}）`);
     }
   }
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }
 
-const hotspots = new Set(manifest.hotspots || []);
 console.log('');
-console.log(`owner 复制      ${report.copied} 个文件`);
-console.log(`patched 自动合并  ${report.merged.length} 个`);
-console.log(`patched 有冲突    ${report.conflicts.length} 个`);
-if (report.conflicts.length) {
-  for (const c of report.conflicts) {
-    const hot = hotspots.has(c.path) ? '  ← 热点（预期）' : '  ← 上游也改过，需人工看';
-    console.log(`      ${c.path}  ${c.hunks} 处冲突${hot}`);
-    console.log(`        ours(selfhost) / base / theirs(upstream) 三方标记写在: ${path.join(outDir, c.path)}.conflict`);
-  }
+console.log(`基线              ${BASE.slice(0, 8)}（上游 ${ref} 相对它改了 ${changed.length} 个文件）`);
+console.log(`follow 自动合并    ${stats.merged.length} 个`);
+console.log(`keep/ignore 保留   ${stats.kept} 个`);
+console.log(`上游独有（未覆盖） ${stats.upstreamOnly} 个`);
+console.log(`需人工冲突         ${stats.conflicts.length} 个`);
+for (const c of stats.conflicts) {
+  console.log(`      ${c.path}  ${c.hunks} 处冲突  ->  ${path.join(outDir, c.path)}.conflict`);
 }
-if (report.missing.length) {
-  console.log(`\n需要人工确认 ${report.missing.length} 项:`);
-  for (const m of report.missing) console.log(`      ${m}`);
+if (stats.missing.length) {
+  console.log(`\n需要人工确认 ${stats.missing.length} 项:`);
+  for (const m of stats.missing) console.log(`      ${m}`);
 }
-
 console.log(`
 下一步
-  1. 处理上面的冲突：打开对应的 .conflict 文件（已含 ours/base/theirs 三方标记），把结果写回原文件名。
-  2. 在 ${outDir} 里构建并测试。注意这一步会改动 RULES_VERSION（上游动过 server/ shared/ data/），
-     所以部署必须挑没有对局在进行的时候——先用 DO 请求速率确认。
-  3. 对照 selfhost/manifest.json 复查：有没有新文件该进 owner、有没有文件上游新增后该改成 patched
-     （届时 git merge 不存在，这一步只能靠人）。`);
+  1. 手工解决上面 .conflict 里的冲突，把结果写回原文件名。
+  2. 在 ${outDir} 构建并测试。RULES_VERSION 会变（上游动过 server/ shared/ data/），
+     部署必须挑没有对局在进行的时候。
+  3. 跑 npm run selfhost:check 确认 manifest 与现实仍然一致。`);
