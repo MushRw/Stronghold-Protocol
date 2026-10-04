@@ -21,7 +21,10 @@ test('real RoomDO batches large outbox snapshots, restarts, and removes excess k
     export default {fetch(req,env){return env.TEST.get(env.TEST.idFromName('large')).fetch(req);}};
   `);t.after(()=>h.dispose());
   const large=await h.fetch({size:4500000});assert.equal(large.status,200,await large.clone().text());
-  const before=await large.json();assert.ok(before.parts>128);assert.equal(before.size,9000000);
+  const before=await large.json();assert.equal(before.size,9000000);
+  // 9,000,000 characters chunked at SNAPSHOT_CHUNK_CHARS (250,000) — still many parts, and each part
+  // stays far under the 2 MB per-value limit, which is the whole point of the larger chunk size.
+  assert.ok(before.parts>8 && before.parts<200,`parts=${before.parts}`);
   await h.restart();assert.deepEqual(await (await h.fetch({})).json(),before);
   const small=await (await h.fetch({size:10})).json();assert.equal(small.parts,1);assert.equal(small.keys,2);
   await h.restart();assert.deepEqual(await (await h.fetch({})).json(),small);

@@ -24,6 +24,15 @@ const edgeIp = (request) => normalizeIp(request.headers.get('CF-Connecting-IP'))
 // active JS timer would keep it awake (billable wall-clock) for the whole match, so a match in
 // progress is pumped by alarms and its checkpoint is only flushed every MATCH_PERSIST_MS.
 const MATCH_PERSIST_MS = 10_000;
+// Persistence is billed in rows written, so the shape of a flush matters as much as its frequency.
+// A SQLite-backed Durable Object allows 2 MB per key+value, and a full match checkpoint is ~40 KB,
+// so chunking at a quarter of that keeps a whole snapshot in one row (plus `snapshot-meta`) instead of
+// three. The old 16,000-character chunk predates the 2 MB limit and tripled every write for no reason.
+const SNAPSHOT_CHUNK_CHARS = 250_000;
+// The event journal is append-only: one row per event costs ~900 rows per match, which dominates once
+// the snapshot is one row. Batching preserves the "every pending event is on disk before the snapshot
+// that describes it" invariant, so recovery stays exact and the journal costs one row per flush.
+const EVENT_BATCH = 64;
 const roomStub = (env, code) => env.ROOMS.get(env.ROOMS.idFromName(code), { locationHint: 'apac' });
 const sameOrigin = (request) => !request.headers.has('Origin') || request.headers.get('Origin') === new URL(request.url).origin;
 async function admit(env, ip, kind) {
@@ -188,6 +197,7 @@ export class RoomDurableObject {
     this.env = env;
     this.sockets = new Map();
     this.lastPersistAt = 0;
+    this.persistedLogId=null;this.persistedEventCount=0;this.persistedLogRows=0;
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping","c":0}', '{"t":"pong","c":0}'));
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const meta = await ctx.storage.get('snapshot-meta');
@@ -207,14 +217,19 @@ export class RoomDurableObject {
       if(snapshot?.matchCheckpoint?.eventLogId) {
         const c=snapshot.matchCheckpoint;
         const count=ctx.storage.sql.exec('SELECT COUNT(*) AS count FROM match_events WHERE match_id=?',c.eventLogId).one().count;
-        if(count!==c.eventCount) throw new Error('INCOMPLETE_MATCH_LOG');
+        // Rows are batches of EVENT_BATCH events; `logRows` is the count a complete journal must have.
+        // Journals written before batching kept one row per event, hence the eventCount fallback.
+        if(count!==(c.logRows ?? c.eventCount)) throw new Error('INCOMPLETE_MATCH_LOG');
         // Retained engines require an Array, but only iterate it during restoration.
         // Stream rows instead of keeping SQL payloads and parsed events together.
-        c.events=new Array(count);
+        c.events=new Array(c.eventCount);
         c.events[Symbol.iterator]=function*(){
-          for(const row of ctx.storage.sql.exec('SELECT payload FROM match_events WHERE match_id=? ORDER BY seq',c.eventLogId))yield JSON.parse(row.payload);
+          for(const row of ctx.storage.sql.exec('SELECT payload FROM match_events WHERE match_id=? ORDER BY seq',c.eventLogId)){
+            const value=JSON.parse(row.payload);
+            if(Array.isArray(value))yield* value; else yield value;
+          }
         };
-        this.persistedLogId=c.eventLogId;this.persistedEventCount=c.events.length;
+        this.persistedLogId=c.eventLogId;this.persistedEventCount=c.events.length;this.persistedLogRows=count;
       }
 
       this.parts = meta?.parts || 0;
@@ -275,7 +290,7 @@ export class RoomDurableObject {
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.deleteAlarm();
       this.parts = 0;
-      this.persistedLogId=null;this.persistedEventCount=0;
+      this.persistedLogId=null;this.persistedEventCount=0;this.persistedLogRows=0;
       for(const adapter of this.sockets.values())adapter.flush();
       return;
     }
@@ -286,23 +301,31 @@ export class RoomDurableObject {
       return;
     }
     this.lastPersistAt = now;
-    // KV values have a size limit. Chunk by UTF-16 characters so even non-ASCII names stay below it.
+    // SQLite-backed values may be 2 MB per key+value. Chunk by UTF-16 characters so even non-ASCII
+    // names stay below it, and chunk coarsely enough that a normal snapshot is a single row.
     const snapshot=rt.snapshot(), checkpoint=snapshot.matchCheckpoint;
-    let newEvents=[], logId=null;
+    let newRows=[], logId=null;
     if(checkpoint) {
       logId=rt.generation + ':' + checkpoint.options.matchNo;
-      const offset=this.persistedLogId===logId ? this.persistedEventCount || 0 : 0;
-      newEvents=checkpoint.events.slice(offset).map((value,i)=>({seq:offset+i,payload:JSON.stringify(value)}));
+      const fresh=this.persistedLogId!==logId;
+      const offset=fresh ? 0 : this.persistedEventCount || 0;
+      const pending=checkpoint.events.slice(offset);
+      // Every pending event is journalled in this flush, so the snapshot's `view` can never describe
+      // events that are still only in memory — recovery would otherwise fail CHECKPOINT_STATE_DIVERGED.
+      for(let i=0;i<pending.length;i+=EVENT_BATCH)
+        newRows.push({seq:offset+i,payload:JSON.stringify(pending.slice(i,i+EVENT_BATCH))});
       checkpoint.eventCount=checkpoint.events.length;checkpoint.eventLogId=logId;
+      checkpoint.logRows=(fresh ? 0 : this.persistedLogRows || 0)+newRows.length;
       delete checkpoint.events;
       this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS match_events (match_id TEXT NOT NULL, seq INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(match_id,seq))');
     }
     const source = JSON.stringify(snapshot);
-    const count = Math.ceil(source.length / 16_000);
+    const count = Math.ceil(source.length / SNAPSHOT_CHUNK_CHARS);
     const entries = { 'snapshot-meta': { parts: count } };
-    for (let i = 0; i < count; i++) entries[`snapshot-${i}`] = source.slice(i * 16_000, (i + 1) * 16_000);
+    for (let i = 0; i < count; i++) entries[`snapshot-${i}`] = source.slice(i * SNAPSHOT_CHUNK_CHARS, (i + 1) * SNAPSHOT_CHUNK_CHARS);
     await this.ctx.storage.transaction(async (txn) => {
-      for(const row of newEvents) this.ctx.storage.sql.exec('INSERT INTO match_events VALUES (?,?,?)',logId,row.seq,row.payload);
+      // REPLACE so a replayed batch (a restored object whose offset moved back) cannot collide.
+      for(const row of newRows) this.ctx.storage.sql.exec('INSERT OR REPLACE INTO match_events VALUES (?,?,?)',logId,row.seq,row.payload);
       const items=Object.entries(entries);
       for(let offset=0;offset<items.length;offset+=128)await txn.put(Object.fromEntries(items.slice(offset,offset+128)));
       if(count<this.parts) {
@@ -312,7 +335,7 @@ export class RoomDurableObject {
     });
 
     this.parts = count;
-    if(checkpoint) {this.persistedLogId=logId;this.persistedEventCount=checkpoint.eventCount;}
+    if(checkpoint) {this.persistedLogId=logId;this.persistedEventCount=checkpoint.eventCount;this.persistedLogRows=checkpoint.logRows;}
     for(const adapter of this.sockets.values()) adapter.flush();
     if(this.env.ACCOUNTS && !this.releasingClaims) {
       const terminal=rt.applications.list().filter(item=>['expired','cancelled','rejected'].includes(item.status) && !item.released);
@@ -423,8 +446,18 @@ export class RoomDurableObject {
     }
     return this.ctx.blockConcurrencyWhile(async () => {
       const adapter = this.sockets.get(ws);
+      const roomOf=()=>this.runtime.lobby.getRoom(this.runtime.code);
+      const hadMatch=!!roomOf()?.match;
       if (adapter) this.runtime.message(adapter, message);
-      await this.persistNow();
+      // A message must not force a flush. Client-side combat reports b.progress about once a second
+      // (4 Hz on boss fields) per authoritative player, so a forced write per message rewrites the whole
+      // snapshot several times per second — that, not snapshot size, is what exhausts the free tier's
+      // 100k rows/day. Durability still holds: the alarm grid (≤5 s) plus MATCH_PERSIST_MS bounds the
+      // window at ~10 s, and the transitions that must be durable now (match over, room applications,
+      // socket setup/teardown) still call persistNow().
+      // Entering or leaving a match is one of those transitions: it is a single message that changes
+      // what recovery has to restore, so it is flushed immediately and everything else is throttled.
+      await (hadMatch!==!!roomOf()?.match ? this.persistNow() : this.persist());
     });
   }
   async webSocketClose(ws, code, reason) {
