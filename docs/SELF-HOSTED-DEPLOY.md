@@ -43,7 +43,7 @@ node tools/fetch-assets.mjs --offline
 
 ## 部署注意
 
-- **每次部署前先 `mv dist .dist-old-$(date +%H%M%S)`**：`npm run build:worker` 开头会 `rm -rf dist/client`（8000+ 文件），在某些环境会被批量删除保护拦住而导致构建失败。
+- **构建脚本会 `rm -rf dist/client`（8000+ 文件）**。在带批量删除保护的环境里（例如带沙箱的助手工具）这一步会被拦下、构建直接失败。正确做法是**在沙箱外运行构建**；退而求其次是把旧目录改名让路：`mv dist .dist-old-$(date +%H%M%S)`。`dist` 本身是构建产物，改名不会丢东西（清理由你决定，别让工具代删）。
 - 部署慢在哪：`wrangler deploy` 会先跑 `build.command`（= `npm run build:worker`），**约 90 秒**用于重拷 400 MB 素材并计算 8543 个文件哈希；实际上传只有 ~42 秒（素材未变时不重复上传）。
 - `wrangler.jsonc` **不要写 `routes`**，否则会覆盖控制台里绑好的自定义域名。
 - 域名绑定可以用 API 完成，不必点控制台：
@@ -59,6 +59,26 @@ node tools/fetch-assets.mjs --offline
 4. **`new Response(body, headersObj)` 是错的**，必须写 `new Response(body, { headers })`。写成前者会静默使用默认 `text/plain`，浏览器直接显示 HTML 源码。
 5. **`e instanceof AccountError` 对跨 DO RPC 的错误无效**（原型丢失，`code`/`status` 仍在）。判断错误要用鸭子类型，并把未知错误 `console.error` 留痕，不要静默压成一个 `AUTH_FAILED`。
 6. **RPC 不能传函数**。把闭包传进 DO 方法会让 workerd 去序列化它的捕获环境（例如 `SqlStorage`），报 `Could not serialize object of type "SqlStorage"`。诊断类方法应当由 DO 自己算好再返回纯数据对象。
+
+## 部署流程：`npm run deploy:safe`（把顺序固定下来）
+
+部署必然 evict 所有 DO、断开所有 WebSocket（客户端收到 **1012**），所以"偶尔要重新连接"**不是房间的 bug，是部署本身**。顺序容易在赶时间时忘掉，所以它是一个脚本：
+
+```bash
+npm run deploy:safe -- --dry-run   # 只体检：线上版本、规则版本、谁在玩，不做任何改动
+npm run deploy:safe                # 正式跑
+```
+
+阶段依次是 `preflight` → `drain` → `maintenance` → `deploy` → `verify` → `record` → `restore`。
+
+- **排空信号是公开房间目录**（`GET /api/rooms`）。它只列 `public && mode === 'coop'` 的房间，**solo / 未公开的房间看不到** —— 脚本会明确说明这一点，而不是假装站点是空的。确定只有自己在单机时用 `--force`。
+- **切换维护需要 `ADMIN_TOKEN`**，而它只存在于 Worker 的 secret 里（本机读不到）。带 `SP_ADMIN_TOKEN=...` 跑，脚本自己开关（**不落盘**）；不带就打印点击步骤，并**等到维护页真的生效**（`GET /` 返回 503）才继续。两种情况下顺序都不会被跳过。
+- **`--allow-rules-change`**：规则版本变了时守卫会拒绝部署；脚本先在体检里讲清楚，确认无人对局后加这个参数（它会给子进程设 `SP_ALLOW_RULES_CHANGE=1`）。
+- **`--maintenance-off`**：脚本中途挂掉之后单独撤维护（幂等，可重复跑）。维护页卡住时也用它。
+- **退出码**：`0` 成功 ｜ `2` 有人在对局、拒绝部署 ｜ `3` 维护未能生效 ｜ `4` 新版本没上报 ｜ `5` 部署失败。**`2` 和 `3` 都是"什么都没动"**，可以安全重跑。
+- **非交互环境必须显式加 `--yes`**（部署前有一次确认）。`--stop-after <阶段>` 可以只做到某一步，例如只开维护、手工部署。
+
+**为什么不是"先挂维护再排空"**：维护守卫会拦掉除 `/admin`、`/api/admin/*`、`/healthz` 之外的一切，维护页一挂上就**看不到房间列表**，也就无从等对局结束。所以顺序是"先排空、确认清空后立刻挂维护"，中间只留几秒。
 
 ## 部署前守卫（已接入）
 
