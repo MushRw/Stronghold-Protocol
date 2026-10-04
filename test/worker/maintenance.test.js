@@ -124,13 +124,17 @@ test('the maintenance API rejects bad input and unauthenticated callers', { time
     headers: { Origin: ORIGIN, 'Content-Type': 'application/json', ...headers },
     body: typeof payload === 'string' ? payload : JSON.stringify(payload),
   });
-  assert.equal((await post({ enabled: true })).status, 403);
+  // Offering nothing is 401 (log in); offering the wrong token is 403. The console tells those apart so it
+  // can show a login form instead of "permission denied".
+  assert.equal((await post({ enabled: true })).status, 401);
   assert.equal((await post({ enabled: true }, { 'X-Admin-Token': 'wrong' })).status, 403);
   assert.equal((await post({ enabled: 'yes' }, { 'X-Admin-Token': TOKEN })).status, 400);
   assert.equal((await post({ enabled: true, extra: 1 }, { 'X-Admin-Token': TOKEN })).status, 400);
   assert.equal((await post('{not json', { 'X-Admin-Token': TOKEN })).status, 400);
-  // Reading the state is operator-only too: it must not become a public outage indicator scraper.
-  assert.equal((await get(h, '/api/admin/maintenance')).status, 403);
+  // Reading the state is operator-only too: it must not become a public outage indicator scraper. With no
+  // credential at all the answer is 401 (log in); 403 is reserved for a credential that was offered and
+  // refused, or a session that is not an operator.
+  assert.equal((await get(h, '/api/admin/maintenance')).status, 401);
   assert.equal((await get(h, '/api/admin/maintenance', { 'X-Admin-Token': TOKEN })).status, 200);
 });
 

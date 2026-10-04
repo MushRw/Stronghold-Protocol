@@ -53,6 +53,22 @@ export class SiteDirectory extends DurableObject {
   }
   maintenance() { return this.getFlag('maintenance'); }
   setMaintenance(state) { return this.setFlag('maintenance', state); }
+  /**
+   * Who may operate the console. Account ids rather than logins: a login can be reused or renamed, and the
+   * id is what a session carries (`session.accountId`), so checking membership is a set lookup with no
+   * ambiguity about which account a name currently means.
+   */
+  operators() {
+    const list = this.getFlag('operators');
+    return Array.isArray(list) ? list.filter((id) => typeof id === 'string') : [];
+  }
+  setOperators(list) { return this.setFlag('operators', list); }
+  /** Resolve a self-hosted login to its account id - the operator list and sessions are keyed by id. */
+  accountForLogin(login) {
+    if (typeof login !== 'string' || !login || login.length > 40) return null;
+    const row = this.sql.exec('SELECT account_id, status FROM local_auth WHERE login=?', login).toArray()[0];
+    return row ? { accountId: row.account_id, status: row.status } : null;
+  }
   /** Called once per finished match; the row itself costs one write, the figures it carries explain thousands. */
   recordWriteStats(stat) {
     this.sql.exec('INSERT INTO write_stats VALUES (?,?,?,?,?,?)',

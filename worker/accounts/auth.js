@@ -119,7 +119,7 @@ export async function handleAuth(request, env, {now = Date.now, fetch: providerF
       if (env.ACCOUNTS) await accountOf(env, user.accountId).setProfile(user);
       const { status, createdAt, reviewedAt, ...profile } = user;
       const sessionToken = randomToken();
-      await directory.saveSession(await hash(sessionToken), { accountId: profile.accountId, user: profile, expiresAt: now() + ACCOUNT_LIMITS.sessionMs });
+      await directory.saveSession(await hash(sessionToken), { accountId: profile.accountId, user: profile, expiresAt: now() + ACCOUNT_LIMITS.sessionMs, createdAt: now() });
       const headers = new Headers({ 'Cache-Control': 'no-store' });
       headers.append('Set-Cookie', cookie(SESSION_COOKIE, sessionToken, ACCOUNT_LIMITS.sessionMs / 1000));
       return new Response(null, { status: 204, headers });
@@ -162,7 +162,7 @@ export async function handleAuth(request, env, {now = Date.now, fetch: providerF
     const user = await directory.resolveGithubUser({id: String(profile.id), login: profile.login.slice(0, 80), name: profile.name, avatarUrl});
     if (env.ACCOUNTS) await accountOf(env, user.accountId).setProfile(user);
     const sessionToken = randomToken();
-    await directory.saveSession(await hash(sessionToken), {accountId: user.accountId, user, expiresAt: now() + ACCOUNT_LIMITS.sessionMs});
+    await directory.saveSession(await hash(sessionToken), {accountId: user.accountId, user, expiresAt: now() + ACCOUNT_LIMITS.sessionMs, createdAt: now()});
     const headers = new Headers({Location: '/', 'Cache-Control': 'no-store'});
     headers.append('Set-Cookie', cookie(SESSION_COOKIE, sessionToken, ACCOUNT_LIMITS.sessionMs / 1000));
     headers.append('Set-Cookie', cookie(OAUTH_COOKIE, '', 0));

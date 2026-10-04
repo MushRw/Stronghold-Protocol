@@ -83,7 +83,7 @@ test('a self-hosted account must be reviewed by the operator before it can play'
   assert.equal((await post('/api/auth/register', login)).status, 409);
 
   // The review list is behind the operator token.
-  assert.equal((await call('/api/admin/accounts')).status, 403);
+  assert.equal((await call('/api/admin/accounts')).status, 401, 'no credential is 401, not 403');
   const pending = await admin('/api/admin/accounts?status=pending');
   assert.equal(pending.status, 200);
   assert.deepEqual((await pending.json()).items.map((x) => [x.login, x.status]), [['博士', 'pending']]);

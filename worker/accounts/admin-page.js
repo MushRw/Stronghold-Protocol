@@ -20,6 +20,11 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   input[type=datetime-local] { flex:0 0 auto; max-width:190px; }
   h3 { font-size:13px; color:var(--muted); font-weight:600; margin:20px 0 8px; }
   .muted { color:var(--muted); }
+  [hidden] { display:none !important; }
+  .warn { color:var(--wait); }
+  details#adv { margin:0 0 20px; padding:10px 12px; background:var(--panel); border:1px solid var(--line); border-radius:10px; }
+  details#adv summary { cursor:pointer; color:var(--muted); font-size:13px; }
+  details#adv .bar { margin:12px 0 4px; }
   button { cursor:pointer; } button:hover { border-color:var(--accent); }
   button.ok { color:var(--ok); } button.no { color:var(--no); }
   table { width:100%; border-collapse:collapse; background:var(--panel); border-radius:10px; overflow:hidden; }
@@ -33,10 +38,43 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   code { background:#111; padding:1px 5px; border-radius:4px; }
 </style></head>
 <body><main>
-  <h1>账号审核</h1>
+  <h1>运营控制台</h1>
   <p class="sub">批准后玩家才能登录并创建房间。口令只存 PBKDF2 散列，这里看不到原密码。</p>
+
   <div class="bar">
-    <input id="token" type="password" placeholder="管理令牌 ADMIN_TOKEN" autocomplete="off" spellcheck="false">
+    <span class="tag" id="who">身份：—</span>
+    <button id="logout" hidden>退出登录</button>
+  </div>
+  <p class="sub warn" id="stale" hidden>本次登录已超过 12 小时：可以查看，但改不了任何设置。重新登录后再操作。</p>
+
+  <section id="gate" hidden>
+    <h3>用站点账号登录</h3>
+    <p class="sub">和玩家登录走同一套接口，会话存在 HttpOnly cookie 里（页面脚本读不到）。</p>
+    <div class="bar">
+      <input id="login" placeholder="账号代号" autocomplete="username" spellcheck="false">
+      <input id="password" type="password" placeholder="密码" autocomplete="current-password">
+      <button id="dologin">登录</button>
+    </div>
+    <p class="msg" id="loginmsg"></p>
+    <h3 id="notophead" hidden>这个账号不是操作员</h3>
+    <p class="sub" id="notopdesc" hidden>第一次用需要拿管理令牌把账号加入操作员名单。令牌只随这一次请求发出，不会存进浏览器。</p>
+    <div class="bar" id="notopbox" hidden>
+      <input id="ntoken" type="password" placeholder="管理令牌 ADMIN_TOKEN" autocomplete="off" spellcheck="false">
+      <input id="nlogin" placeholder="要激活的账号代号" spellcheck="false">
+      <button id="doactivate">加入操作员</button>
+    </div>
+  </section>
+
+  <details id="adv">
+    <summary>高级：用管理令牌操作（脚本 / 忘记密码时）</summary>
+    <div class="bar">
+      <input id="token" type="password" placeholder="管理令牌 ADMIN_TOKEN" autocomplete="off" spellcheck="false">
+    </div>
+    <p class="sub">令牌等价于操作员身份，也会留在这页的 sessionStorage 里以便下次免填。日常操作建议改用上面的账号登录。</p>
+  </details>
+
+  <div id="console" hidden>
+  <div class="bar">
     <select id="filter">
       <option value="pending">待审核</option>
       <option value="approved">已批准</option>
@@ -72,12 +110,13 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   </section>
   <div id="list"></div>
   <p class="msg" id="msg"></p>
+  </div>
 </main>
 <script>
 const el = (id) => document.getElementById(id);
 const tokenBox = el('token');
+// Remembered for convenience only; the token stays a break-glass path, and the day-to-day way in is a login.
 tokenBox.value = sessionStorage.getItem('sp_admin_token') || '';
-tokenBox.addEventListener('input', () => sessionStorage.setItem('sp_admin_token', tokenBox.value.trim()));
 const STATUS = { pending:'待审核', approved:'已批准', rejected:'已拒绝' };
 const stamp = (ms) => ms ? new Date(ms).toLocaleString('zh-CN', { hour12:false }) : '—';
 // A datetime-local input speaks local wall-clock with no zone, so shift by the offset before slicing ISO.
@@ -232,16 +271,97 @@ el('list').addEventListener('click', (event) => {
   const button = event.target.closest('button[data-login]');
   if (button) review(button.dataset.login, button.dataset.status);
 });
+
+// --- who am I -------------------------------------------------------------------------------------
+// The console has three states and the server decides which: a login session (an identity, HttpOnly cookie,
+// revocable on its own), the ADMIN_TOKEN (break-glass, and the only way to grant the first operator seat),
+// or neither - in which case all this page offers is a login form.
+const TOKEN_HEADER = { 'X-Admin-Token': tokenBox.value.trim() };
+async function whoami() {
+  const response = await fetch('/api/admin/session', { headers: { ...TOKEN_HEADER } });
+  return response.json();
+}
+function render(state) {
+  const gate = el('gate'), view = el('console'), who = el('who');
+  const isToken = state.via === 'token';
+  gate.hidden = !!state.authenticated;
+  view.hidden = !state.authenticated;
+  el('logout').hidden = state.via !== 'session';
+  el('stale').hidden = !(state.authenticated && !state.fresh);
+  who.className = 'tag ' + (state.authenticated ? (state.fresh ? 'approved' : 'pending') : 'rejected');
+  if (!state.authenticated) {
+    who.textContent = '身份：未登录';
+    // Not being an operator is a different problem from not being logged in, and it has its own way out.
+    const notOperator = state.code === 'NOT_OPERATOR';
+    el('notophead').hidden = !notOperator;
+    el('notopdesc').hidden = !notOperator;
+    el('notopbox').hidden = !notOperator;
+    if (notOperator && !el('nlogin').value) el('nlogin').value = state.login || '';
+    return;
+  }
+  who.textContent = isToken
+    ? '身份：管理令牌（脚本同款）'
+    : '身份：' + (state.login || '操作员') + '（操作员' + (state.fresh ? '' : '，登录已超期') + '）';
+  if (isToken) return;
+  load(); loadMaint(); loadDiag(); loadWrites();
+}
+async function probe() {
+  try { render(await whoami()); }
+  catch (e) { el('who').textContent = '身份：读取失败'; el('who').className = 'tag rejected'; }
+}
+async function doLogin() {
+  const msg = el('loginmsg');
+  msg.textContent = ''; msg.className = 'msg';
+  el('dologin').disabled = true;
+  try {
+    const response = await fetch('/api/auth/login', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: el('login').value.trim(), password: el('password').value }) });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error === 'NOT_APPROVED' ? '这个账号还没通过审核' : (body.error || ('HTTP ' + response.status)));
+    el('password').value = '';
+    await probe();
+  } catch (e) { msg.textContent = '登录失败：' + e.message; msg.className = 'msg err'; }
+  finally { el('dologin').disabled = false; }
+}
+async function activate() {
+  const msg = el('loginmsg');
+  msg.textContent = ''; msg.className = 'msg';
+  el('doactivate').disabled = true;
+  try {
+    const response = await fetch('/api/admin/operators', { method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': el('ntoken').value.trim() },
+      body: JSON.stringify({ login: el('nlogin').value.trim(), action: 'add' }) });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error === 'UNKNOWN_LOGIN' ? '没有这个账号' : (body.error || ('HTTP ' + response.status)));
+    if (body.status && body.status !== 'approved') msg.textContent = '已加入名单，但该账号状态是「' + body.status + '」，通过审核后才能登录。';
+    el('ntoken').value = '';
+    await probe();
+  } catch (e) { msg.textContent = '激活失败：' + e.message; msg.className = 'msg err'; }
+  finally { el('doactivate').disabled = false; }
+}
+async function doLogout() {
+  el('logout').disabled = true;
+  try { await fetch('/api/auth/logout', { method: 'POST' }); } catch { /* the cookie is cleared either way */ }
+  el('logout').disabled = false;
+  await probe();
+}
+
 el('reload').addEventListener('click', () => { load(); loadMaint(); loadDiag(); loadWrites(); });
 el('filter').addEventListener('change', load);
 el('mtoggle').addEventListener('click', toggleMaint);
 el('dreload').addEventListener('click', loadDiag);
 el('wreload').addEventListener('click', loadWrites);
-tokenBox.addEventListener('input', () => { loadMaint(); loadDiag(); loadWrites(); });
-load();
-loadMaint();
-loadDiag();
-loadWrites();
+el('dologin').addEventListener('click', doLogin);
+el('doactivate').addEventListener('click', activate);
+el('logout').addEventListener('click', doLogout);
+el('password').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+tokenBox.addEventListener('input', () => {
+  sessionStorage.setItem('sp_admin_token', tokenBox.value.trim());
+  TOKEN_HEADER['X-Admin-Token'] = tokenBox.value.trim();
+  probe();
+});
+probe();
 </script></main></body></html>`;
 
 const adminPageHeaders = () => ({

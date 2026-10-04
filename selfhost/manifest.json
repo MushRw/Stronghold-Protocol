@@ -46,6 +46,7 @@
     "test/worker/account-integration.test.js",
     "test/worker/account-storage.test.js",
     "test/worker/admin-page.test.js",
+    "test/worker/admin-session.test.js",
     "test/worker/deploy-safe.test.js",
     "test/worker/event-rows.test.js",
     "test/worker/large-snapshot.test.js",

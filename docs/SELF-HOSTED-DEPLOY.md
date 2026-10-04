@@ -109,7 +109,16 @@ npm run rules:record
 
 ## 运营工具
 
-- `GET /api/admin/accounts?status=pending|approved|rejected|`（头 `X-Admin-Token`）列出账号。
+- `GET /api/admin/accounts?status=pending|approved|rejected|` 列出账号（`status` 空串 = 全部）。
+- `GET /api/admin/session`（无需凭据）回答"我是谁"，供控制台决定渲染哪一块：未登录 / 已登录但不是操作员 / 是操作员（含 `fresh`：本次登录是否在写操作窗口内）。匿名调用只会得到 `authenticated:false`，不泄露任何信息。
+- **两条凭据路径**（`worker/accounts/admin.js` 的 `adminIdentity`）：
+  - **登录会话**（日常）：复用玩家的 `__Host-sp_session`（`HttpOnly`），账号需在 `site_flags.operators` 名单里（存 **accountId**，不是代号 —— 代号可改可重用）。
+  - **`ADMIN_TOKEN`**（救急 / 脚本）：`deploy:safe` 用它，忘了密码也靠它；**它也是唯一能授予第一个操作员席位的东西**（没有令牌就没人能产生第一个操作员）。
+- **写操作要求"最近 12 小时登录过"**（`OPERATOR_WRITE_WINDOW_MS`）：玩家会话是 30 天，直接拿它当管理凭据等于"半年前登录的设备还能关站"。读操作不受限；超期时接口返回 `403 RELOGIN_REQUIRED`，页面提示重新登录。会话记录新增 `createdAt`（加性字段），旧会话没有该字段即视为不新鲜，需重新登录一次。
+- `POST /api/admin/operators` body `{login, action:'add'|'remove'}`（**只接受令牌**，会话不能授予/回收席位，否则被盗的会话能自我固化）；`GET` 同路径列出名单。名单项是 accountId，`action` 与 body 都是严格白名单。
+- **状态码约定**：`401 LOGIN_REQUIRED`=没带凭据，`403 FORBIDDEN`=带了凭据但不对，`403 NOT_OPERATOR`=登录了但不在名单，`403 RELOGIN_REQUIRED`=是操作员但登录太久（只有写操作）。页面靠这几个码区分"该登录 / 该找人开权限 / 该重新登录"。
+- CSRF 不需要额外机制：会话 cookie 是 `SameSite=Lax`（跨站 POST 不带 cookie），且所有改状态的管理路由都过 `requireOrigin`。
+- `/admin` 页面现在有三态：登录表单 / "你不是操作员"（附"用令牌激活"入口）/ 控制台；令牌框收进折叠的「高级」区，仍可用于救急。
 - `POST /api/admin/review` body `{login, status}` 批准或拒绝；**拒绝会立即删除该账号已有会话**。
 - `GET /api/admin/diag`（头 `X-Admin-Token`）逐个探活各 DO 并报告表行数；DO 被重置时这些调用会失败，这是判断"是不是 DO 挂了"的第一步。
   - 返回的 `probes` 是**结构化**的：`{ [对象名]: { ok, detail } }`。**判断成败是服务端的责任** —— 早先它返回的是给人读的字符串（`"SITES: ok"`），页面拿它跟 `'ok'` 比较，结果把每个对象都报成异常，还把标签打印了两遍。
