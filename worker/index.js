@@ -13,6 +13,7 @@ import { handleLobbyRoutes, roomApplications } from './rooms/routes.js';
 import { handleHistoryRoutes } from './archive/routes.js';
 import { publishArchive,prepareArchive } from './archive/outbox.js';
 import { handleBackupRoutes } from './storage/backup.js';
+import { eventRows } from './storage/event-rows.js';
 import { maintenanceGuard } from './maintenance.js';
 
 // the deployed commit (tools/build-worker.mjs buildId; esbuild defines it, unbundled tests see 'local')
@@ -30,10 +31,8 @@ const MATCH_PERSIST_MS = 10_000;
 // so chunking at a quarter of that keeps a whole snapshot in one row (plus `snapshot-meta`) instead of
 // three. The old 16,000-character chunk predates the 2 MB limit and tripled every write for no reason.
 const SNAPSHOT_CHUNK_CHARS = 250_000;
-// The event journal is append-only: one row per event costs ~900 rows per match, which dominates once
-// the snapshot is one row. Batching preserves the "every pending event is on disk before the snapshot
-// that describes it" invariant, so recovery stays exact and the journal costs one row per flush.
-const EVENT_BATCH = 64;
+// Event-journal batching, and the byte cap that keeps one huge event from growing a row without bound,
+// live in ./storage/event-rows.js so they can be unit-tested without a Worker runtime.
 const roomStub = (env, code) => env.ROOMS.get(env.ROOMS.idFromName(code), { locationHint: 'apac' });
 const sameOrigin = (request) => !request.headers.has('Origin') || request.headers.get('Origin') === new URL(request.url).origin;
 async function admit(env, ip, kind) {
@@ -322,8 +321,7 @@ export class RoomDurableObject {
       const pending=checkpoint.events.slice(offset);
       // Every pending event is journalled in this flush, so the snapshot's `view` can never describe
       // events that are still only in memory — recovery would otherwise fail CHECKPOINT_STATE_DIVERGED.
-      for(let i=0;i<pending.length;i+=EVENT_BATCH)
-        newRows.push({seq:offset+i,payload:JSON.stringify(pending.slice(i,i+EVENT_BATCH))});
+      newRows=eventRows(pending, offset);
       checkpoint.eventCount=checkpoint.events.length;checkpoint.eventLogId=logId;
       checkpoint.logRows=(fresh ? 0 : this.persistedLogRows || 0)+newRows.length;
       delete checkpoint.events;
