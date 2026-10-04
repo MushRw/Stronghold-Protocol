@@ -93,6 +93,10 @@ npm run rules:record
 - `POST /api/admin/review` body `{login, status}` 批准或拒绝；**拒绝会立即删除该账号已有会话**。
 - `GET /api/admin/diag`（头 `X-Admin-Token`）逐个探活各 DO 并报告表行数；DO 被重置时这些调用会失败，这是判断"是不是 DO 挂了"的第一步。
 - 该接口有令牌保护，因此会把内部错误原因放在 `detail` 字段里返回——公开接口（注册/登录）不会。
+- `GET /api/admin/maintenance` 读维护开关，`POST` body `{enabled, message?, until?}` 切换（都要 `X-Admin-Token`，页面按钮在 `/admin` 顶部）。
+  - 打开后**全站返回 503 维护页**（`/admin`、`/api/admin/*`、`/healthz` 除外——开关必须留着才能关回来）。**不需要部署**，这是它存在的理由：部署会 evict 所有 DO、断掉进行中的对局。
+  - 你在浏览器里访问一次 `/?key=<令牌>` 会换到一张 12 小时的 cookie，之后自己照常进站（令牌不再留在地址栏里）。
+  - 开关存在 SiteDirectory 的 `site_flags` 表，读取带 **10 秒 per-isolate 缓存**，切换后最长 10 秒全网生效；目录读不到时**放行**（fail open），不让读开关本身成为故障源。
 
 ## 出错时的自查顺序
 
@@ -124,3 +128,4 @@ fetch('/api/admin/diag',{headers:{'X-Admin-Token':'<你的令牌>'}}).then(r=>r.
 - **后台 404**：`/admin` 不在 `run_worker_first` 白名单。
 - **所有 DO 被重置**：包内嵌了 10 个历史规则引擎（58 MiB），改为默认不嵌 + 24 MiB 护栏。
 - **账号被永久锁死**：`/api/rooms` 记的座位租约从不续期，而 `getActiveSeat()` 不看 `expiresAt`；客户端建房后若没连上，座位永久残留，之后每次都 409。现改为建房前**向房间核实**该账号是否真的还在（去问 `/_account`，房间不存在或已不含该账号则释放席位）。注意不能简单地让 `getActiveSeat()` 遵守 `expiresAt`：座位上游戏时不会续期，那样会让坐着的玩家被判定过期、进而开出第二个房间。
+- **首页绕不过维护页**：`assets.run_worker_first` 原本只列 `/api/*`、`/ws`、`/healthz`、`/admin`，首页 HTML 由静态资源直出，任何 Worker 层的开关都拦不住它；现已加入 `/` 与 `/index.html`。`test/worker/maintenance.test.js` 里有配置契约断言守着这条，改配置时会被测试拦下。
