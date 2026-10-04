@@ -471,6 +471,23 @@ export class RoomDurableObject {
         }
         return json({activeSeat:{roomId:rt.code,roomGeneration:rt.generation},status:rt.status()});
       }
+      // The account layer's escape hatch. A seat claim is only released when the room stops listing the
+      // account, so anything the room still remembers - a session, a stale join approval, an unexpired
+      // reservation - keeps the account locked out of every room with no way out but waiting. This drops
+      // all three at the account holder's own request, which is no more than leaving the room by hand.
+      if (url.pathname === '/_forget' && request.method === 'POST') {
+        const accountId = request.headers.get('X-Account-ID');
+        if (request.headers.get('X-Room-Generation') !== rt.generation) return error(404, 'ROOM_NOT_FOUND');
+        let left = false;
+        for (const item of rt.applications.list(accountId)) {
+          if (item.status === 'pending' || item.status === 'approved') rt.applications.cancel(accountId, item.id);
+        }
+        if (rt.reservation && rt.reservation.accountId === accountId) rt.reservation = null;
+        const session = [...rt.registry.all()].find(s => s.accountId === accountId);
+        if (session && rt.lobby.roomOf(session)) { rt.lobby.leave(session); left = true; }
+        await this.persistNow();
+        return json({ left });
+      }
       if (url.pathname === '/_status' && request.method === 'GET') {
         const status = rt.status();
         await this.persist();

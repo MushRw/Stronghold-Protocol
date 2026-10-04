@@ -53,6 +53,7 @@
     "test/worker/local-auth.test.js",
     "test/worker/maintenance.test.js",
     "test/worker/session-cache.test.js",
+    "test/worker/solo-seat.test.js",
     "test/worker/spectators.test.js",
     "test/worker/versions.test.js",
     "test/worker/write-stats.test.js",

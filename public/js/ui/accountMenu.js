@@ -1,5 +1,5 @@
 import { useEffect,useState } from '../../vendor/hooks.module.js';
-import { html,Button,Panel,MicroLabel,DifficultyTag } from './components.js';
+import { html,Button,Panel,MicroLabel,DifficultyTag,confirmDialog } from './components.js';
 import { account,accountRequest } from '../account.js';
 import { AccountSignIn } from './localAuth.js';
 import { net,identity } from '../net.js';
@@ -39,9 +39,20 @@ export function AccountMenu() {
   useEffect(()=>{if(account.user) accountRequest('/api/me/active-match').then(r=>setActive(r.activeSeat)).catch(()=>{});},[]);
   if(!account.enabled)return null;
   const resume=async()=>{setBusy(true);try{await net.resumeActive();}finally{setBusy(false);}};
+  // The way out of a seat the room will not let go of. Without it "you already have a room" is a dead end:
+  // starting again is refused and continuing fails, with no third option offered anywhere.
+  const giveUp=async()=>{
+    setBusy(true);
+    try{await net.releaseSeat();setActive(null);}
+    catch(e){toast(e.message,'warn');}
+    finally{setBusy(false);}
+  };
   return html`<div class="account-actions">
     ${account.user ? html`
       ${active ? html`<${Button} size="sm" icon="play" loading=${busy} onClick=${()=>run(resume)}>继续对局<//>` : null}
+      ${active ? html`<${Button} size="sm" variant="ghost" disabled=${busy} onClick=${async()=>{
+        if(await confirmDialog({title:'放弃这个对局',text:'会离开当前房间并释放座位，且无法再回到这一局。',okText:'放弃',danger:true}))run(giveUp);
+      }}>放弃对局<//>` : null}
       <${Button} variant="secondary" size="sm" icon="book" onClick=${()=>store.patch('ui',{accountPage:'history'})}>对局记录<//>
       <${Button} variant="secondary" size="sm" icon="signal" onClick=${()=>store.patch('ui',{accountPage:'statistics'})}>个人统计<//>
       <${LogoutButton} />

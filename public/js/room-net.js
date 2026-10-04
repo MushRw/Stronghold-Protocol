@@ -1,7 +1,7 @@
 // Workers transport: one direct WebSocket to the Durable Object for the selected room.
 import { Net, NetError, configureTransport } from './net.js';
 import { validateC2S } from '../../shared/protocol.js';
-import { accountRequest } from './account.js';
+import { account, accountRequest, ACCOUNT_ERRORS } from './account.js';
 
 const CODE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/;
 export function roomFromToken(token) {
@@ -37,7 +37,8 @@ export class RoomNet extends Net {
         signal: abort.signal, cache: 'no-store',
       });
       const result = await response.json();
-      if (!response.ok) throw new NetError(result.error || 'INTERNAL', undefined, result.detail);
+      // The seat guard answers here, not through accountRequest, so its codes would arrive untranslated.
+      if (!response.ok) throw new NetError(result.error || 'INTERNAL', ACCOUNT_ERRORS[result.error], result.detail);
       return result;
     } catch (error) {
       if (error instanceof NetError) throw error;
@@ -245,6 +246,22 @@ export class RoomNet extends Net {
     if(route.reserved)throw new NetError('ROOM_NOT_FOUND','房间创建尚未完成，请等待预留过期后重新创建');
     if(route.join)return this.joinApproved(route);
     await this._openRoute(route,null);
+  }
+  async releaseSeat() {
+    // The escape hatch a stuck account needs. A seat claim is only released when the room stops listing
+    // the account, so a room that still lists it - a live session, an approved join request, an unexpired
+    // reservation - answers "you already have a room" to every new attempt and there is nothing else the
+    // player can do. Asking the room to forget the account is no more than leaving by hand.
+    const result = await accountRequest('/api/me/release-seat', {});
+    this.room = null;
+    this.close();
+    this.route = null;
+    this._routeToken = null;
+    this._manualClose = false;
+    this.application = null;
+    this._emit('application', null);
+    this._setStatus('online');
+    return result;
   }
   async spectate(code) {
     if(this._switching)throw new NetError('RATE');

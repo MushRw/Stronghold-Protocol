@@ -36,14 +36,38 @@ export async function clearStaleApplication(env,accountId) {
 }
 export async function handleAccountRoutes(request, env) {
   const path = new URL(request.url).pathname;
-  if (!['/api/me/active-match','/api/me/resume','/api/me/preferences'].includes(path)) return null;
+  if (!['/api/me/active-match','/api/me/resume','/api/me/preferences','/api/me/release-seat'].includes(path)) return null;
   try {
     const preferences = path === '/api/me/preferences';
-    if (preferences ? !['GET','POST'].includes(request.method) : request.method !== (path.endsWith('/resume') ? 'POST' : 'GET')) return json({error:'METHOD'},405);
+    // The resume and release-seat routes change server state, so they are POST-only like every other
+    // mutating call here; release-seat would otherwise have been readable as a GET.
+    const postOnly = path.endsWith('/resume') || path === '/api/me/release-seat';
+    if (preferences ? !['GET','POST'].includes(request.method) : request.method !== (postOnly ? 'POST' : 'GET')) return json({error:'METHOD'},405);
     if (request.method === 'POST') requireOrigin(request);
     const session = await authenticate(request,env);
     if (!session || !env.ACCOUNTS) return json({error:'LOGIN_REQUIRED'},401);
     const account = accountOf(env,session.accountId);
+    if (path === '/api/me/release-seat') {
+      // Giving up the seat is the one thing a stuck account must be able to do for itself. Without it the
+      // only cure is waiting: the claim is released when the room stops listing the account, and a room
+      // that still lists it (a live session, an approved join request, an unexpired reservation) would
+      // keep answering "you already have a room" to every attempt to start another one.
+      const held = await account.getActiveSeat();
+      if (!held) return json({activeSeat:null,left:false});
+      let left = false;
+      try {
+        const response = await env.ROOMS.get(env.ROOMS.idFromName(held.roomId)).fetch(new Request('https://room.internal/_forget', {
+          method:'POST',headers:{'X-Account-ID':session.accountId,'X-Room-Generation':held.roomGeneration}}));
+        // A room that no longer exists cannot vouch for the claim either, so a 404 releases it just the same.
+        if (response.ok) left = !!(await response.json()).left;
+        else if (response.status !== 404) throw new Error('ROOM_UNAVAILABLE');
+      } catch (e) {
+        if (e?.message === 'ROOM_UNAVAILABLE') return json({error:'ROOM_UNAVAILABLE'},503);
+        console.error('[release-seat]', e?.stack || e?.message || e);
+      }
+      await account.releaseSeat({claimId:held.claimId});
+      return json({activeSeat:null,left});
+    }
     if (preferences) {
       if (request.method === 'GET') return json({accountId:session.accountId,preferences:await account.getPreferences()});
       const body = await preferenceBody(request);
