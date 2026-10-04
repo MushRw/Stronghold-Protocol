@@ -50,6 +50,14 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     </div>
     <p class="sub">进入维护后全站返回维护页（不影响在线对局的中途结算，但会拒绝新连接）。开启状态下访问 <code>/?key=管理令牌</code> 可换到一张放行 cookie，之后照常进入。</p>
   </section>
+  <section>
+    <div class="bar">
+      <span class="tag" id="wstate">写入量：—</span>
+      <button id="wreload" disabled>刷新</button>
+    </div>
+    <p class="sub">每局结束时由房间上报的 rows written（免费层每天 10 万行）。云端分析接口拿不到这个数，所以这是判断持久化改动有没有真正生效的唯一依据。</p>
+    <div id="wlist"></div>
+  </section>
   <div id="list"></div>
   <p class="msg" id="msg"></p>
 </main>
@@ -124,16 +132,36 @@ async function toggleMaint() {
     el('msg').textContent = '维护开关失败：' + e.message; el('msg').className = 'msg err';
   } finally { el('mtoggle').disabled = false; }
 }
+async function loadWrites() {
+  const state = el('wstate'), list = el('wlist'), button = el('wreload');
+  if (!tokenBox.value.trim()) {
+    state.textContent = '写入量：先填管理令牌'; state.className = 'tag'; list.innerHTML = ''; button.disabled = true; return;
+  }
+  button.disabled = false;
+  try {
+    const { items, averageRows } = await call('/api/admin/write-stats');
+    state.textContent = '写入量：最近 ' + items.length + ' 局，平均 ' + averageRows + ' 行/局';
+    state.className = 'tag ok';
+    if (!items.length) { list.innerHTML = '<div class="empty">还没有对局记录</div>'; return; }
+    const rows = items.map((it) => '<tr><td>' + it.roomId.replace(/[^A-Za-z0-9]/g,'') + '</td><td><strong>' + it.rows + '</strong></td>'
+      + '<td>' + it.flushes + '</td><td>' + Math.round(it.matchMs / 1000) + ' 秒</td><td>' + stamp(it.at) + '</td></tr>').join('');
+    list.innerHTML = '<table><thead><tr><th>房间</th><th>写入行数</th><th>flush 次数</th><th>时长</th><th>结束时间</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  } catch (e) {
+    state.textContent = '写入量：读取失败'; state.className = 'tag rejected'; list.innerHTML = '';
+  }
+}
 el('list').addEventListener('click', (event) => {
   const button = event.target.closest('button[data-login]');
   if (button) review(button.dataset.login, button.dataset.status);
 });
-el('reload').addEventListener('click', () => { load(); loadMaint(); });
+el('reload').addEventListener('click', () => { load(); loadMaint(); loadWrites(); });
 el('filter').addEventListener('change', load);
 el('mtoggle').addEventListener('click', toggleMaint);
-tokenBox.addEventListener('input', loadMaint);
+el('wreload').addEventListener('click', loadWrites);
+tokenBox.addEventListener('input', () => { loadMaint(); loadWrites(); });
 load();
 loadMaint();
+loadWrites();
 </script></main></body></html>`;
 
 const adminPageHeaders = () => ({

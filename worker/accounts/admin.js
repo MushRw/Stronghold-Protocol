@@ -96,6 +96,13 @@ export async function handleAdminRoutes(request, env) {
         until: input.until, updatedAt: Date.now() });
       return json({ maintenance: state });
     }
+    if (path === '/api/admin/write-stats' && request.method === 'GET') {
+      // What each recent match cost in rows written. The free plan's analytics API cannot report this,
+      // so these figures are the only way to tell whether a persistence change actually helped.
+      const items = await directoryOf(env).writeStats(50);
+      const totalRows = items.reduce((sum, item) => sum + item.rows, 0);
+      return json({ items, totalRows, averageRows: items.length ? Math.round(totalRows / items.length) : 0 });
+    }
     if (path === '/api/admin/review' && request.method === 'POST') {
       requireOrigin(request);
       const payload = await body(request);

@@ -36,6 +36,11 @@ export class SiteDirectory extends DurableObject {
     // purpose: taking the site down for maintenance must not require a deploy (a deploy evicts every
     // room and drops live matches), so the switch has to be readable and writable at runtime.
     this.sql.exec('CREATE TABLE IF NOT EXISTS site_flags (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)');
+    // Per-match write accounting, reported by a room when a match ends. The free plan's analytics API
+    // does not expose rowsWritten, so without this the only signal that the budget is gone is the limit
+    // email — which arrives after writes have already started failing. One row per match is nothing
+    // next to the thousands a match writes, and it is the only way to check whether a change helped.
+    this.sql.exec('CREATE TABLE IF NOT EXISTS write_stats (at INTEGER NOT NULL, room_id TEXT NOT NULL, match_ms INTEGER NOT NULL, rows INTEGER NOT NULL, flushes INTEGER NOT NULL, seconds INTEGER NOT NULL)');
   }
   getFlag(key) {
     const row = this.sql.exec('SELECT value FROM site_flags WHERE key=?', key).toArray()[0];
@@ -48,6 +53,18 @@ export class SiteDirectory extends DurableObject {
   }
   maintenance() { return this.getFlag('maintenance'); }
   setMaintenance(state) { return this.setFlag('maintenance', state); }
+  /** Called once per finished match; the row itself costs one write, the figures it carries explain thousands. */
+  recordWriteStats(stat) {
+    this.sql.exec('INSERT INTO write_stats VALUES (?,?,?,?,?,?)',
+      stat.at, stat.roomId, stat.matchMs, stat.rows, stat.flushes, stat.seconds);
+    this.sql.exec('DELETE FROM write_stats WHERE at < ?', stat.at - 30 * 86400000);
+    return stat;
+  }
+  writeStats(limit = 50) {
+    const size = Number.isSafeInteger(limit) && limit > 0 && limit <= 200 ? limit : 50;
+    return this.sql.exec('SELECT at,room_id,match_ms,rows,flushes,seconds FROM write_stats ORDER BY at DESC LIMIT ?', size)
+      .toArray().map((r) => ({ at: r.at, roomId: r.room_id, matchMs: r.match_ms, rows: r.rows, flushes: r.flushes, seconds: r.seconds }));
+  }
   resolveGithubUser({id, login, name, avatarUrl}) {
     if (!/^\d{1,20}$/.test(id) || typeof login !== 'string' || login.length > 80) throw new AccountError('INVALID_PROFILE');
     const displayName = typeof name === 'string' ? name.trim().slice(0, 80) : '';

@@ -203,6 +203,10 @@ export class RoomDurableObject {
     this.sockets = new Map();
     this.lastPersistAt = 0;
     this.persistedLogId=null;this.persistedEventCount=0;this.persistedLogRows=0;
+    // `alarmAt` is what this isolate believes is armed; storage is the fallback after an eviction.
+    this.alarmAt = null;
+    this.lastInMatch = false;      // edge-detects a match ending, so its cost can be reported once
+    this.writes = { rows: 0, flushes: 0, since: Date.now() };
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping","c":0}', '{"t":"pong","c":0}'));
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const meta = await ctx.storage.get('snapshot-meta');
@@ -294,6 +298,7 @@ export class RoomDurableObject {
     if (rt.isEmpty()) {
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.deleteAlarm();
+      this.alarmAt = null;
       this.parts = 0;
       this.persistedLogId=null;this.persistedEventCount=0;this.persistedLogRows=0;
       for(const adapter of this.sockets.values())adapter.flush();
@@ -340,6 +345,13 @@ export class RoomDurableObject {
     });
 
     this.parts = count;
+    // Rows written by this flush: the snapshot chunks and their meta, plus one row per journalled batch.
+    // Deletions bill too, but a stable snapshot size means they are rare. Counting here is what makes
+    // "did that change help?" answerable at all — the analytics API cannot tell us on the free plan.
+    this.writes.rows += count + 1 + newRows.length;
+    this.writes.flushes += 1;
+    if (this.lastInMatch && !active) this.ctx.waitUntil(this.reportWrites());
+    this.lastInMatch = active;
     if(checkpoint) {this.persistedLogId=logId;this.persistedEventCount=checkpoint.eventCount;this.persistedLogRows=checkpoint.logRows;}
     for(const adapter of this.sockets.values()) adapter.flush();
     if(this.env.ACCOUNTS && !this.releasingClaims) {
@@ -387,11 +399,37 @@ export class RoomDurableObject {
     }
     await this.scheduleAlarm();
   }
+  /**
+   * Hand a finished match's write cost to the site directory, then start counting the next one.
+   * `rows written` is the budget a free-tier deployment runs out of, and that plan's analytics API does
+   * not expose it, so each match leaves one row describing what it cost. Without this the only feedback
+   * is the limit email — which arrives after writes have already started failing.
+   */
+  async reportWrites() {
+    const now = Date.now();
+    const stat = { at: now, roomId: this.runtime.code || '', matchMs: Math.max(0, now - this.writes.since),
+      rows: this.writes.rows, flushes: this.writes.flushes,
+      seconds: Math.round(Math.max(0, now - this.writes.since) / 1000) };
+    this.writes = { rows: 0, flushes: 0, since: now };
+    if (!this.env.SITES || !stat.rows) return;
+    try { await directoryOf(this.env).recordWriteStats(stat); }
+    catch (e) { console.error('[writes]', e?.stack || e?.message || e); }
+  }
   async scheduleAlarm() {
     // Always re-arm from the next alarm(): a throttled persist() must not leave the object unscheduled.
     const at = this.runtime.nextAlarm();
-    if (at) await this.ctx.storage.setAlarm(at);
-    else await this.ctx.storage.deleteAlarm();
+    if (!at) {
+      if (this.alarmAt !== null) { this.alarmAt = null; await this.ctx.storage.deleteAlarm(); }
+      return;
+    }
+    // setAlarm() bills a row written, and an in-match persist() runs on every client message, so
+    // re-arming unconditionally would cost one row per message to move an alarm that already exists.
+    // Only arm when the deadline genuinely moves earlier; after an eviction fall back to storage.
+    if (this.alarmAt !== null && this.alarmAt <= at) return;
+    const armed = await this.ctx.storage.getAlarm();
+    if (armed !== null && armed <= at) { this.alarmAt = armed; return; }
+    await this.ctx.storage.setAlarm(at);
+    this.alarmAt = at;
   }
   async fetch(request) {
     await this.ready;
@@ -422,7 +460,7 @@ export class RoomDurableObject {
       if (url.pathname === '/_status' && request.method === 'GET') {
         const status = rt.status();
         await this.persist();
-        return status ? json(status) : error(404, 'ROOM_NOT_FOUND');
+        return status ? json({ ...status, writes: this.writes }) : error(404, 'ROOM_NOT_FOUND');
       }
       if (url.pathname !== '/_ws' || request.method !== 'GET') return error(404, 'BAD_MSG');
       if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return error(426, 'BAD_MSG');
@@ -478,12 +516,22 @@ export class RoomDurableObject {
   async alarm() {
     await this.ready;
     return this.ctx.blockConcurrencyWhile(async () => {
-      this.refreshAutoResponses();
-      this.runtime.pump();
-      this.runtime.sweep();
-      await this.persist();
+      // The alarm that fired has been consumed, so what this isolate remembered is no longer armed.
+      this.alarmAt = null;
+      try {
+        this.refreshAutoResponses();
+        this.runtime.pump();
+        this.runtime.sweep();
+        await this.persist();
+      } catch (e) {
+        // A failed flush must not take the alarm chain down with it: without the re-arm below nothing
+        // would ever pump this object again and the match would freeze for good — client messages hit
+        // the same failing write, so the players could not recover it either. Degrade, do not die.
+        console.error('[alarm/persist]', e?.stack || e?.message || e);
+      }
       // Re-arm unconditionally: the match clock lives in alarms, not in an in-memory timer.
-      await this.scheduleAlarm();
+      try { await this.scheduleAlarm(); }
+      catch (e) { console.error('[alarm/arm]', e?.stack || e?.message || e); }
     });
   }
 }
