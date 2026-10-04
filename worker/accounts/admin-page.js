@@ -42,6 +42,14 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     </select>
     <button id="reload">刷新</button>
   </div>
+  <section>
+    <div class="bar">
+      <span class="tag" id="mstate">维护状态：—</span>
+      <input id="mmsg" placeholder="维护公告（可选，访客会看到这句话）" maxlength="500">
+      <button id="mtoggle" disabled>进入维护</button>
+    </div>
+    <p class="sub">进入维护后全站返回维护页（不影响在线对局的中途结算，但会拒绝新连接）。开启状态下访问 <code>/?key=管理令牌</code> 可换到一张放行 cookie，之后照常进入。</p>
+  </section>
   <div id="list"></div>
   <p class="msg" id="msg"></p>
 </main>
@@ -87,13 +95,45 @@ async function load() {
     msg.className = 'msg err';
   }
 }
+async function loadMaint() {
+  const state = el('mstate'), button = el('mtoggle');
+  if (!tokenBox.value.trim()) {
+    state.textContent = '维护状态：先填管理令牌'; state.className = 'tag'; button.disabled = true; return;
+  }
+  button.disabled = false;
+  try {
+    const { maintenance } = await call('/api/admin/maintenance');
+    const on = !!maintenance?.enabled;
+    state.textContent = '维护状态：' + (on ? '已开启' : '正常');
+    state.className = 'tag ' + (on ? 'pending' : 'approved');
+    button.textContent = on ? '结束维护' : '进入维护';
+    if (maintenance?.message) el('mmsg').value = maintenance.message;
+  } catch (e) {
+    state.textContent = '维护状态：读取失败'; state.className = 'tag rejected';
+  }
+}
+async function toggleMaint() {
+  const enter = el('mtoggle').textContent === '进入维护';
+  el('msg').textContent = '';
+  el('mtoggle').disabled = true;
+  try {
+    await call('/api/admin/maintenance', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ enabled: enter, message: el('mmsg').value.trim() || null }) });
+    await loadMaint();
+  } catch (e) {
+    el('msg').textContent = '维护开关失败：' + e.message; el('msg').className = 'msg err';
+  } finally { el('mtoggle').disabled = false; }
+}
 el('list').addEventListener('click', (event) => {
   const button = event.target.closest('button[data-login]');
   if (button) review(button.dataset.login, button.dataset.status);
 });
-el('reload').addEventListener('click', load);
+el('reload').addEventListener('click', () => { load(); loadMaint(); });
 el('filter').addEventListener('change', load);
+el('mtoggle').addEventListener('click', toggleMaint);
+tokenBox.addEventListener('input', loadMaint);
 load();
+loadMaint();
 </script></main></body></html>`;
 
 const adminPageHeaders = () => ({

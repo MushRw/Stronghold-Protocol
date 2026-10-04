@@ -32,7 +32,22 @@ export class SiteDirectory extends DurableObject {
     // lands in `users` under a synthetic id so backup/restore keeps working without knowing the provider.
     this.sql.exec("CREATE TABLE IF NOT EXISTS local_auth (login TEXT PRIMARY KEY COLLATE NOCASE, account_id TEXT NOT NULL UNIQUE, salt TEXT NOT NULL, verifier TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, reviewed_at INTEGER)");
     this.sql.exec('CREATE INDEX IF NOT EXISTS local_auth_status ON local_auth(status,created_at)');
+    // Site-wide operational flags. They live in the directory rather than in `wrangler.jsonc` on
+    // purpose: taking the site down for maintenance must not require a deploy (a deploy evicts every
+    // room and drops live matches), so the switch has to be readable and writable at runtime.
+    this.sql.exec('CREATE TABLE IF NOT EXISTS site_flags (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)');
   }
+  getFlag(key) {
+    const row = this.sql.exec('SELECT value FROM site_flags WHERE key=?', key).toArray()[0];
+    return row ? JSON.parse(row.value) : null;
+  }
+  setFlag(key, value) {
+    this.sql.exec('INSERT INTO site_flags VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at',
+      key, JSON.stringify(value), Date.now());
+    return value;
+  }
+  maintenance() { return this.getFlag('maintenance'); }
+  setMaintenance(state) { return this.setFlag('maintenance', state); }
   resolveGithubUser({id, login, name, avatarUrl}) {
     if (!/^\d{1,20}$/.test(id) || typeof login !== 'string' || login.length > 80) throw new AccountError('INVALID_PROFILE');
     const displayName = typeof name === 'string' ? name.trim().slice(0, 80) : '';

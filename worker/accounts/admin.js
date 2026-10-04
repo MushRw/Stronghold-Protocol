@@ -5,7 +5,7 @@ import { directoryOf, hash, json, requireOrigin } from './auth.js';
 
 const TOKEN_MIN = 32;
 /** SHA-256 both sides first so the comparison length no longer depends on the secret. */
-async function tokenMatches(presented, expected) {
+export async function tokenMatches(presented, expected) {
   if (typeof presented !== 'string' || !presented) return false;
   const [a, b] = await Promise.all([hash(presented), hash(expected)]);
   let diff = 0;
@@ -36,6 +36,23 @@ async function body(request) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
     || Object.keys(parsed).some((k) => !['login', 'status'].includes(k))) throw new AccountError('INVALID_BODY');
   return parsed;
+}
+/**
+ * The maintenance flag is the one switch an operator needs during an incident, so it is a first-class
+ * admin route rather than something edited in `wrangler.jsonc`: changing config would mean a deploy,
+ * and a deploy evicts every room and drops live matches.
+ */
+async function flagBody(request) {
+  const raw = await request.text();
+  if (raw.length > 1024) throw new AccountError('BODY_TOO_LARGE', 413);
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { throw new AccountError('INVALID_BODY'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new AccountError('INVALID_BODY');
+  if (Object.keys(parsed).some((k) => !['enabled', 'message', 'until'].includes(k))) throw new AccountError('INVALID_BODY');
+  if (typeof parsed.enabled !== 'boolean') throw new AccountError('INVALID_BODY');
+  if (parsed.message != null && (typeof parsed.message !== 'string' || parsed.message.length > 500)) throw new AccountError('INVALID_BODY');
+  if (parsed.until != null && !Number.isSafeInteger(parsed.until)) throw new AccountError('INVALID_BODY');
+  return { enabled: parsed.enabled, message: parsed.message || null, until: parsed.until || null };
 }
 export async function handleAdminRoutes(request, env) {
   const path = new URL(request.url).pathname;
@@ -68,6 +85,16 @@ export async function handleAdminRoutes(request, env) {
       try { sizes = await directory.diagnostics(); }
       catch (e) { sizes = 'unavailable: ' + (e?.message || e); }
       return json({ probes, sizes });
+    }
+    if (path === '/api/admin/maintenance') {
+      const directory = directoryOf(env);
+      if (request.method === 'GET') return json({ maintenance: (await directory.maintenance()) || { enabled: false } });
+      if (request.method !== 'POST') return json({ error: 'METHOD' }, 405);
+      requireOrigin(request);
+      const input = await flagBody(request);
+      const state = await directory.setMaintenance({ enabled: input.enabled, message: input.message,
+        until: input.until, updatedAt: Date.now() });
+      return json({ maintenance: state });
     }
     if (path === '/api/admin/review' && request.method === 'POST') {
       requireOrigin(request);

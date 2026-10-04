@@ -13,6 +13,7 @@ import { handleLobbyRoutes, roomApplications } from './rooms/routes.js';
 import { handleHistoryRoutes } from './archive/routes.js';
 import { publishArchive,prepareArchive } from './archive/outbox.js';
 import { handleBackupRoutes } from './storage/backup.js';
+import { maintenanceGuard } from './maintenance.js';
 
 // the deployed commit (tools/build-worker.mjs buildId; esbuild defines it, unbundled tests see 'local')
 const BUILD = typeof __SP_BUILD__ === 'string' ? __SP_BUILD__ : 'local';
@@ -66,6 +67,10 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const backup=await handleBackupRoutes(request,env);if(backup)return backup;
+    // The maintenance gate runs before anything that costs a Durable Object call, so a taken-down site
+    // stops spending the free tier's budget instead of merely hiding the UI.
+    const maintenance = await maintenanceGuard(request, env);
+    if (maintenance) return maintenance;
     if (path === '/admin') return adminConfigured(env) ? new Response(ADMIN_PAGE, { headers: adminPageHeaders() }) : error(404, 'NOT_FOUND');
     if(env.ADMISSION && (path.startsWith('/api/auth/') || path==='/api/rooms' && request.method==='GET' || /\/applications$/.test(path))) {
       const kind=path.startsWith('/api/auth/local')||path==='/api/auth/register'||path==='/api/auth/login'?'localauth'
