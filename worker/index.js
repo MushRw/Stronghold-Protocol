@@ -460,7 +460,14 @@ export class RoomDurableObject {
       if (url.pathname === '/_status' && request.method === 'GET') {
         const status = rt.status();
         await this.persist();
-        return status ? json({ ...status, writes: this.writes }) : error(404, 'ROOM_NOT_FOUND');
+        return status ? json(status) : error(404, 'ROOM_NOT_FOUND');
+      }
+      // Internal only. `/api/rooms/:code` proxies to /_status, so the live flush counter must not live
+      // there: the public response is the fixed {code,mode,inMatch,full} contract that clients assert on.
+      if (url.pathname === '/_diag' && request.method === 'GET') {
+        const status = rt.status();
+        if (!status) return error(404, 'ROOM_NOT_FOUND');
+        return json({ ...status, writes: this.writes, parts: this.parts });
       }
       if (url.pathname !== '/_ws' || request.method !== 'GET') return error(404, 'BAD_MSG');
       if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return error(426, 'BAD_MSG');
