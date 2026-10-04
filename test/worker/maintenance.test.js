@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAccountHarness } from './helpers/account-harness.js';
 import { bundleWorker } from '../../tools/build-worker.mjs';
+import { maintenanceActive } from '../../worker/maintenance.js';
 
 // Filesystem-backed data loaders only resolve under the production build substitutions, so this runs
 // the same bundle the edge does — which is also what makes the maintenance gate worth testing at all.
@@ -131,4 +132,51 @@ test('the maintenance API rejects bad input and unauthenticated callers', { time
   // Reading the state is operator-only too: it must not become a public outage indicator scraper.
   assert.equal((await get(h, '/api/admin/maintenance')).status, 403);
   assert.equal((await get(h, '/api/admin/maintenance', { 'X-Admin-Token': TOKEN })).status, 200);
+});
+
+// The page has always printed "预计恢复时间", but nothing honoured it until now: an operator who set an
+// end time was really asking for the site to stay down until someone remembered. These pin the rule.
+test('an end time ends the maintenance', () => {
+  const now = 1_000_000;
+  assert.equal(maintenanceActive(null, now), false);
+  assert.equal(maintenanceActive({ enabled: false }, now), false);
+  assert.equal(maintenanceActive({ enabled: true }, now), true, 'no deadline means it holds until turned off');
+  assert.equal(maintenanceActive({ enabled: true, until: now + 1 }, now), true);
+  assert.equal(maintenanceActive({ enabled: true, until: now + 1 }, now + 2), false);
+  assert.equal(maintenanceActive({ enabled: true, until: now }, now), false, 'at the deadline it is already over');
+  assert.equal(maintenanceActive({ enabled: true, until: now - 1 }, now), false);
+  assert.equal(maintenanceActive({ enabled: true, until: 'soon' }, now), true, 'a non-integer deadline cannot expire');
+});
+
+test('an expired deadline serves the site while the flag still reads enabled', { timeout: 90000 }, async (t) => {
+  const h = await harness();
+  t.after(() => h.dispose());
+  const toggle = (payload) => h.request(ORIGIN + '/api/admin/maintenance', {
+    method: 'POST',
+    headers: { 'X-Admin-Token': TOKEN, Origin: ORIGIN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  const past = await toggle({ enabled: true, until: Date.now() - 1000 });
+  assert.equal(past.status, 200);
+  assert.equal((await past.json()).maintenance.enabled, true, 'the stored flag keeps saying enabled');
+  assert.ok(Number.isSafeInteger((await (await get(h, '/api/admin/maintenance', { 'X-Admin-Token': TOKEN })).json()).maintenance.until));
+
+  // Enforcement happens on read, so no write happens when a deadline lapses - restarting proves the gate
+  // re-evaluates rather than having been patched at write time.
+  await h.restart();
+  assert.equal((await get(h, '/')).status, 404, 'the site is served once the deadline has passed');
+  assert.equal((await get(h, '/api/rooms')).status, 200);
+  assert.notEqual((await get(h, '/ws?room=ABCD')).status, 503, 'no longer gated either');
+
+  // The API still reports the raw flag with its (past) deadline, so the page can say "expired" instead of
+  // "in maintenance" - the two must not be conflated in either direction.
+  const state = (await (await get(h, '/api/admin/maintenance', { 'X-Admin-Token': TOKEN })).json()).maintenance;
+  assert.equal(state.enabled, true);
+  assert.ok(state.until <= Date.now());
+
+  // A future deadline still blocks, so the feature is a deadline and not a way to disable the gate.
+  assert.equal((await toggle({ enabled: true, until: Date.now() + 60_000 })).status, 200);
+  await h.restart();
+  assert.equal((await get(h, '/')).status, 503);
 });

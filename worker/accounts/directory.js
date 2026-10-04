@@ -65,6 +65,22 @@ export class SiteDirectory extends DurableObject {
     return this.sql.exec('SELECT at,room_id,match_ms,rows,flushes,seconds FROM write_stats ORDER BY at DESC LIMIT ?', size)
       .toArray().map((r) => ({ at: r.at, roomId: r.room_id, matchMs: r.match_ms, rows: r.rows, flushes: r.flushes, seconds: r.seconds }));
   }
+  /**
+   * Per-day totals, so an operator can see the quota filling up instead of learning about it from the
+   * limit email (on the free plan exceeding rows written fails the write, it does not throttle it).
+   *
+   * Bucketed by UTC day because that is when the plan's quota resets - a local-time bucket would put
+   * two different quotas in one row. Returns the day as an integer (ms/86_400_000) rather than a string
+   * so the caller decides how to format it.
+   */
+  writeStatsDaily(days = 7) {
+    const span = Number.isSafeInteger(days) && days > 0 && days <= 30 ? days : 7;
+    return this.sql.exec(
+      'SELECT at / 86400000 AS day, COUNT(*) AS matches, SUM(rows) AS rows, SUM(flushes) AS flushes '
+      + 'FROM write_stats WHERE at >= ? GROUP BY day ORDER BY day DESC',
+      Date.now() - span * 86400000,
+    ).toArray().map((r) => ({ day: r.day, matches: r.matches, rows: r.rows, flushes: r.flushes }));
+  }
   resolveGithubUser({id, login, name, avatarUrl}) {
     if (!/^\d{1,20}$/.test(id) || typeof login !== 'string' || login.length > 80) throw new AccountError('INVALID_PROFILE');
     const displayName = typeof name === 'string' ? name.trim().slice(0, 80) : '';

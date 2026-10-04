@@ -34,6 +34,18 @@ export async function maintenanceState(env) {
   }
 }
 
+/**
+ * Whether the gate should actually block. `until` is enforced here rather than only displayed: an
+ * operator who sets an end time reasonably expects the site to come back by itself, and the failure this
+ * guards against is the maintenance page being left on for days by accident. The stored flag is not
+ * rewritten - an expired deadline simply stops counting, so this costs no writes.
+ */
+export function maintenanceActive(state, now = Date.now()) {
+  if (!state?.enabled) return false;
+  if (Number.isSafeInteger(state.until) && state.until <= now) return false;
+  return true;
+}
+
 /** Only the operator gets past the gate: the admin token itself, or the cookie it hands out. */
 async function operatorPass(request, env) {
   if (!adminConfigured(env)) return false;
@@ -70,7 +82,7 @@ export async function maintenanceGuard(request, env) {
   }
   if (await operatorPass(request, env)) return null;
   const state = await maintenanceState(env);
-  if (!state?.enabled) return null;
+  if (!maintenanceActive(state)) return null;
   return new Response(maintenancePage(state), {
     status: 503,
     headers: {

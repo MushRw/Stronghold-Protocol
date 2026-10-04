@@ -4,6 +4,8 @@ import { AccountError, requireLogin, requireReview } from '../../shared/account-
 import { directoryOf, hash, json, requireOrigin } from './auth.js';
 
 const TOKEN_MIN = 32;
+/** Workers Free: Durable Object rows written per day. Going over fails writes instead of throttling them. */
+const FREE_ROWS_PER_DAY = 100_000;
 /** SHA-256 both sides first so the comparison length no longer depends on the secret. */
 export async function tokenMatches(presented, expected) {
   if (typeof presented !== 'string' || !presented) return false;
@@ -99,9 +101,19 @@ export async function handleAdminRoutes(request, env) {
     if (path === '/api/admin/write-stats' && request.method === 'GET') {
       // What each recent match cost in rows written. The free plan's analytics API cannot report this,
       // so these figures are the only way to tell whether a persistence change actually helped.
-      const items = await directoryOf(env).writeStats(50);
+      const directory = directoryOf(env);
+      const items = await directory.writeStats(50);
       const totalRows = items.reduce((sum, item) => sum + item.rows, 0);
-      return json({ items, totalRows, averageRows: items.length ? Math.round(totalRows / items.length) : 0 });
+      // The quota is per UTC day and going over fails every write, so how much of today is already spent
+      // matters more than any single match. Scope: only room flushes are counted - the directory's own
+      // writes (accounts, sessions, the room list) never pass through a room, and a match is reported only
+      // once it ends. So this is a floor rather than the whole picture, and the page labels it that way.
+      const daily = await directory.writeStatsDaily(7);
+      const today = Math.floor(Date.now() / 86400000);
+      const used = daily.find((bucket) => bucket.day === today) || { matches: 0, rows: 0, flushes: 0 };
+      return json({ items, totalRows, averageRows: items.length ? Math.round(totalRows / items.length) : 0,
+        daily, quota: { limit: FREE_ROWS_PER_DAY, day: today, rows: used.rows, matches: used.matches,
+          percent: Math.round((used.rows / FREE_ROWS_PER_DAY) * 1000) / 10 } });
     }
     if (path === '/api/admin/review' && request.method === 'POST') {
       requireOrigin(request);

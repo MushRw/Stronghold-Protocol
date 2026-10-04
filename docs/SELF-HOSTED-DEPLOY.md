@@ -115,12 +115,15 @@ npm run rules:record
 - 该接口有令牌保护，因此会把内部错误原因放在 `detail` 字段里返回——公开接口（注册/登录）不会。
 - `GET /api/admin/maintenance` 读维护开关，`POST` body `{enabled, message?, until?}` 切换（都要 `X-Admin-Token`，页面按钮在 `/admin` 顶部）。
   - 打开后**全站返回 503 维护页**（`/admin`、`/api/admin/*`、`/healthz` 除外——开关必须留着才能关回来）。**不需要部署**，这是它存在的理由：部署会 evict 所有 DO、断掉进行中的对局。
+  - **`until` 是真的会生效的截止时间**：到点后守卫不再拦截（判断在读取侧，`maintenance.js` 的 `maintenanceActive()`），所以到期**不产生任何写入**——`site_flags` 里的值仍然是 `enabled: true`，只是不再算数。页面会把这种状态显示成"已到期（站点已恢复）"，并给一个"进入维护"按钮，而不是"结束维护"。留空表示一直维护到手动关闭。
   - 你在浏览器里访问一次 `/?key=<令牌>` 会换到一张 12 小时的 cookie，之后自己照常进站（令牌不再留在地址栏里）。
-  - 开关存在 SiteDirectory 的 `site_flags` 表，读取带 **10 秒 per-isolate 缓存**，切换后最长 10 秒全网生效；目录读不到时**放行**（fail open），不让读开关本身成为故障源。
-- `GET /api/admin/write-stats`（头 `X-Admin-Token`）返回最近 50 局的 **rows written 实际值**（`/admin` 页面有表格：房间、写入行数、flush 次数、时长）。
+  - 开关存在 SiteDirectory 的 `site_flags` 表，读取带 **10 秒 per-isolate 缓存**，切换/到期后最长 10 秒全网生效；目录读不到时**放行**（fail open），不让读开关本身成为故障源。
+- `GET /api/admin/write-stats`（头 `X-Admin-Token`）返回三块：最近 50 局、**按天的汇总**（`daily`，UTC 日界，与免费额度重置一致）、以及**今日额度**（`quota: {limit, day, rows, matches, percent}`）。`/admin` 页面把今日占用放在最上面。
   - 免费层的分析接口**不提供** `rowsWritten`，所以这是唯一能看到"一局到底写了多少行"的途径；每局结束时由房间上报一行，代价可忽略。
-  - 对局中也能看实时值：房间 `/_status` 的返回里带 `writes: {rows, flushes, since}`（需要房间码）。
+  - **口径要说清**：只统计房间 flush（目录、账号、会话那些写入不经过房间），而且**对局结束才计入**。所以它是**下限**，不是当天全部用量 —— 页面也是这么写的。
+  - 对局中看实时值走房间的 `/_diag`（**不是 `/_status`**）：`/_status` 被 `/api/rooms/:code` 公开代理，客户端还断言了它的返回形状，内部计数放在那里既是泄露也是破坏契约。
   - 用途：任何持久化改动（分块大小、节流、批量）的效果，都靠这张表验证，别再用推算。
+- `GET /api/admin/diag` 同样在页面上（`/admin` 的"诊断"一节）：探针 + 各表行数，全部渲染出来。
 
 ## 出错时的自查顺序
 
