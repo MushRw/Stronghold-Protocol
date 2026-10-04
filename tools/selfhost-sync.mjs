@@ -15,9 +15,9 @@
 // `hotspots`: after a sync, only the hotspot conflicts need real thought.
 //
 // Usage:
-//   node tools/selfhost-sync.mjs                      # against upstream/master, into a temp dir
+//   node tools/selfhost-sync.mjs                      # against sgangss/master, into a temp dir
 //   node tools/selfhost-sync.mjs v0.1.2               # against a tag
-//   node tools/selfhost-sync.mjs upstream/master --out E:/sp-sync --fetch
+//   node tools/selfhost-sync.mjs sgangss/master --out E:/sp-sync --fetch
 import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
@@ -28,7 +28,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const argv = process.argv.slice(2);
 const flags = new Set(argv.filter((a) => a.startsWith('--')));
 const outIndex = argv.indexOf('--out');
-const ref = argv.find((a) => !a.startsWith('--') && argv[outIndex + 1] !== a) || 'upstream/master';
+const ref = argv.find((a) => !a.startsWith('--') && argv[outIndex + 1] !== a) || 'sgangss/master';
 
 const run = (cmd, args, opts = {}) => {
   const out = spawnSync(cmd, args, { cwd: root, encoding: 'utf8', ...opts });
@@ -42,8 +42,8 @@ const gitOut = (...args) => {
 const gitOk = (...args) => run('git', args, { stdio: 'ignore' }).status === 0;
 
 if (flags.has('--fetch')) {
-  console.log('fetch upstream…');
-  run('git', ['-c', 'http.sslVerify=false', 'fetch', 'upstream']);
+  console.log('fetch ' + ref.split('/')[0] + '…');
+  run('git', ['-c', 'http.sslVerify=false', 'fetch', ref.split('/')[0]]);
 }
 if (!gitOk('cat-file', '-e', ref)) {
   console.error(`找不到 ref: ${ref}。先跑 node tools/selfhost-sync.mjs --fetch`);

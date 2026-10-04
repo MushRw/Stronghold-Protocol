@@ -26,12 +26,13 @@ if (!snapshot || !gitOk('cat-file', '-e', snapshot)) {
   console.error(`manifest.snapshot.commit 无效或不存在: ${snapshot}`);
   process.exit(2);
 }
-if (!gitOk('cat-file', '-e', 'upstream/master')) {
-  console.error('找不到 upstream/master。先跑: git -c http.sslVerify=false fetch upstream');
+if (!gitOk('cat-file', '-e', UPSTREAM_REF)) {
+  console.error('找不到上游 ref。先跑: git -c http.sslVerify=false fetch ' + UPSTREAM_REF.split('/')[0] + '');
   process.exit(2);
 }
 
-const upstreamFiles = new Set(git('ls-tree', '-r', '--name-only', 'upstream/master').split('\n').filter(Boolean));
+const UPSTREAM_REF = (manifest.upstream?.remote || 'sgangss') + '/master';
+const upstreamFiles = new Set(git('ls-tree', '-r', '--name-only', UPSTREAM_REF).split('\n').filter(Boolean));
 const changed = git('diff', '--name-only', snapshot, 'HEAD').split('\n').filter(Boolean);
 const owner = new Set(manifest.owner || []);
 const patched = new Set(manifest.patched || []);
@@ -65,11 +66,11 @@ if (gone.length) {
 // 4. Hotspots are the files both sides edit. Report when upstream last touched each one, so a sync
 //    starts from the real conflict list instead of from a guess.
 const hotspotLines = [...hotspots].map((f) => {
-  const last = git('log', '-1', '--format=%h %ad %s', '--date=short', 'upstream/master', '--', f).trim();
+  const last = git('log', '-1', '--format=%h %ad %s', '--date=short', UPSTREAM_REF, '--', f).trim();
   return `      ${f}\n        ${last ? last.slice(0, 110) : '(上游从未改动)'}`;
 });
 
-const upstreamHead = git('log', '-1', '--format=%h %ad %s', '--date=short', 'upstream/master').trim();
+const upstreamHead = git('log', '-1', '--format=%h %ad %s', '--date=short', UPSTREAM_REF).trim();
 console.log('selfhost 边界校验');
 console.log(`  上游 HEAD      ${upstreamHead.slice(0, 100)}`);
 console.log(`  快照           ${snapshot.slice(0, 8)}`);

@@ -2,9 +2,10 @@
   "_comment": "本仓库 = 上游 sgangss/Stronghold-Protocol（纯游戏项目）+ 本清单描述的 Cloudflare 自托管层。两者没有 git 共同历史（共同提交 0 个），所以不能用 merge/rebase/'Sync fork'；同步只能按本清单搬运。改代码后请跑 npm run selfhost:check 校验清单仍然成立。",
   "upstream": {
     "repo": "sgangss/Stronghold-Protocol",
-    "remote": "upstream",
+    "remote": "sgangss",
     "whatItIs": "纯游戏项目（浏览器端 + Node 服务器 + Dockerfile），没有 worker/ 目录",
-    "relationship": "无 git 共同祖先；GitHub 上的 fork 关系是仓库级的，与历史无关"
+    "relationship": "无 git 共同祖先；GitHub 上的 fork 关系是仓库级的，与历史无关",
+    "remotesNote": "origin=你的仓库；upstream=BBleae（fork 来源，与 GitHub 上的 parent 一致，但已停滞、无新内容）；sgangss=游戏本体的官方上游，也就是同步对象 —— 本字段被 tools/selfhost-*.mjs 读取，改 remote 名只需改这里"
   },
   "snapshot": {
     "commit": "056a1ca",
