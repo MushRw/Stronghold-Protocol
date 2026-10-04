@@ -1,5 +1,6 @@
 // Build an allowlisted public tree and bundle the existing game engine for Workers.
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -26,9 +27,35 @@ async function copyTree(source, target, allow, prefix = '') {
   }
 }
 
-/** The deployed commit (Workers Builds: WORKERS_CI_COMMIT_SHA; else git), shown by /healthz and the settings. */
+/** Read HEAD straight out of .git: no subprocess, and correct even where spawning is unavailable. */
+function readGitHead(root) {
+  try {
+    const dotGit = path.join(root, '.git');
+    // A worktree or submodule keeps .git as a file pointing at the real git dir.
+    let dir = dotGit;
+    if (fsSync.statSync(dotGit).isFile()) {
+      const pointer = fsSync.readFileSync(dotGit, 'utf8').trim().replace(/^gitdir:\s*/i, '');
+      dir = path.resolve(root, pointer);
+    }
+    const head = fsSync.readFileSync(path.join(dir, 'HEAD'), 'utf8').trim();
+    if (!head.startsWith('ref: ')) return head; // detached HEAD: the sha is right there
+    const ref = head.slice(5).trim();
+    try { return fsSync.readFileSync(path.join(dir, ref), 'utf8').trim(); }
+    catch {
+      // A freshly packed repository has no loose ref file.
+      const packed = fsSync.readFileSync(path.join(dir, 'packed-refs'), 'utf8');
+      const line = packed.split('\n').find((l) => l.endsWith(' ' + ref));
+      return line ? line.split(' ')[0] : '';
+    }
+  } catch { return ''; }
+}
+
+/** The deployed commit (Workers Builds: WORKERS_CI_COMMIT_SHA; else HEAD), shown by /healthz and the settings. */
 export function buildId({ root = ROOT, env = process.env } = {}) {
-  const sha = env.WORKERS_CI_COMMIT_SHA || spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout?.trim();
+  // Was `spawnSync('git', ...).stdout?.trim()`. Inside this project's tool sandbox sync spawning fails
+  // with EBUSY, and the optional chaining swallowed it: every local build silently shipped the tag
+  // "local" instead of the commit. Reading .git has no such failure mode and is faster.
+  const sha = env.WORKERS_CI_COMMIT_SHA || readGitHead(root);
   return /^[0-9a-f]{7,40}$/.test(sha || '') ? sha.slice(0, 7) : 'local';
 }
 
@@ -226,7 +253,11 @@ export async function bundleWorker({ root = ROOT, outfile = path.join(root, 'dis
     [path.join(root, 'server/sim/content/bonds.js'), ['./bonds/core.js', './bonds/addon.js', './support/meta.js']],
   ]);
   const result = await build({
-    entryPoints: [path.join(root, entry)],
+    // resolve, not join: callers may pass an absolute entry (test/worker/versions.test.js does, and on
+    // Windows a temp dir on another drive cannot be expressed relative to the repo, so path.relative
+    // hands back an absolute path). join() would paste it after root and esbuild would look for
+    // "<root>/C:\Users\...\fixture.js". resolve() resets to the absolute path on a drive change.
+    entryPoints: [path.resolve(root, entry)],
     outfile,
     bundle: true, format: 'esm', platform: 'neutral', target: 'es2022',
     external: ['node:*', 'cloudflare:*'], minify: true, keepNames: true, metafile: true,

@@ -13,7 +13,6 @@
     "warning": "不要用它当合并基线（见 upstreamBase.why），它只用于识别\"我们改过哪些文件\"。"
   },
   "owner": [
-    ".gitignore",
     "docs/ACCOUNTS-HISTORY.md",
     "docs/CLOUDFLARE.md",
     "docs/SELF-HOSTED-DEPLOY.md",
@@ -67,6 +66,7 @@
     "wrangler.jsonc"
   ],
   "patched": [
+    ".gitignore",
     "package.json",
     "public/css/components.css",
     "public/css/screens/game.css",

@@ -11,23 +11,43 @@
 //   policy.ignore  left exactly as it is          (Node runtime, upstream tests/tools/docs)
 //   upstreamBase   the upstream commit to merge against - NOT our snapshot; see the note in the manifest.
 //
-// Usage:
-//   node tools/selfhost-sync.mjs                      # sgangss/master, into a temp dir
-//   node tools/selfhost-sync.mjs v0.1.2 --out E:/sp-sync --fetch
-import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+// The order matters and cost two rounds to get right:
+//   1. export the upstream tree
+//   2. copy EVERY file of ours that we own or changed on top of it (the upstream tree simply does not
+//      contain the Workers layer, and it ships a version of public/js/audio.js with the voice feature
+//      removed) - without this step the result is missing our files
+//   3. three-way merge the files upstream changed inside `follow`, reading `ours` from our working tree
+//      (never from the export - that was a bug: comparing our file to itself reported false success)
+//
+// All subprocess calls are async: spawnSync fails with EBUSY in this project's tool sandbox.
+import { existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, rmSync, mkdtempSync, statSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
+const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL('..', import.meta.url));
-const run = (cmd, args, opts = {}) => spawnSync(cmd, args, { cwd: root, encoding: 'utf8', ...opts });
-const gitOut = (...args) => {
-  const out = run('git', args);
-  if (out.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${out.stderr?.trim()}`);
+const OPTS = { cwd: root, encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 };
+
+const runAsync = (cmd, args, opts = {}) => execFileAsync(cmd, args, { ...OPTS, ...opts });
+/** Git with the exit code preserved instead of thrown - `git merge-file` reports conflict count that way. */
+const gitRaw = async (...args) => {
+  try {
+    const { stdout, stderr } = await runAsync('git', args);
+    return { code: 0, stdout, stderr };
+  } catch (error) {
+    if (typeof error.code === 'number') return { code: error.code, stdout: error.stdout ?? '', stderr: error.stderr ?? '' };
+    throw error;
+  }
+};
+const git = async (...args) => {
+  const out = await gitRaw(...args);
+  if (out.code !== 0) throw new Error(`git ${args.join(' ')} failed: ${out.stderr.trim()}`);
   return out.stdout;
 };
-const gitOk = (...args) => run('git', args, { stdio: 'ignore' }).status === 0;
+const gitOk = async (...args) => (await gitRaw(...args)).code === 0;
 
 const manifest = JSON.parse(readFileSync(path.join(root, 'selfhost/manifest.json'), 'utf8'));
 const argv = process.argv.slice(2);
@@ -39,11 +59,11 @@ const ref = argv.find((a) => !a.startsWith('--') && argv[outIndex + 1] !== a)
 if (flags.has('--fetch')) {
   const remote = ref.split('/')[0];
   console.log(`fetch ${remote}...`);
-  run('git', ['-c', 'http.sslVerify=false', 'fetch', remote]);
+  await runAsync('git', ['-c', 'http.sslVerify=false', 'fetch', remote]);
 }
-if (!gitOk('cat-file', '-e', ref)) { console.error(`找不到 ref: ${ref}`); process.exit(2); }
+if (!(await gitOk('cat-file', '-e', ref))) { console.error(`找不到 ref: ${ref}`); process.exit(2); }
 const BASE = manifest.upstreamBase?.commit;
-if (!BASE || !gitOk('cat-file', '-e', BASE)) { console.error(`找不到合并基线: ${BASE}`); process.exit(2); }
+if (!BASE || !(await gitOk('cat-file', '-e', BASE))) { console.error(`找不到合并基线: ${BASE}`); process.exit(2); }
 
 const policy = manifest.policy || {};
 const inList = (list, p) => (list || []).some((x) => p === x || p.startsWith(x));
@@ -51,62 +71,73 @@ const inList = (list, p) => (list || []).some((x) => p === x || p.startsWith(x))
 // (server/match/ is followed, but server/match/checkpoint.js is ours).
 const classify = (p) => (inList(policy.keep, p) ? 'keep' : inList(policy.follow, p) ? 'follow' : 'ignore');
 
-const slug = ref.replace(/[^A-Za-z0-9._-]/g, '_');
-const outDir = outIndex >= 0 ? path.resolve(argv[outIndex + 1]) : path.join(os.tmpdir(), 'sp-sync', slug);
+const outDir = outIndex >= 0 ? path.resolve(argv[outIndex + 1]) : path.join(os.tmpdir(), 'sp-sync', ref.replace(/[^A-Za-z0-9._-]/g, '_'));
 if (existsSync(outDir)) rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
+// 1. upstream tree
 const tarball = path.join(outDir, '.upstream.tar');
-const arc = run('git', ['archive', '--format=tar', '-o', tarball, ref]);
-if (arc.status !== 0) { console.error(`git archive 失败: ${arc.stderr?.trim()}`); process.exit(2); }
-const untar = run('tar', ['-xf', tarball, '-C', outDir]);
-if (untar.status !== 0) { console.error(`解包失败（需要 tar）: ${untar.stderr?.trim()}`); process.exit(2); }
+const arc = await gitRaw('archive', '--format=tar', '-o', tarball, ref);
+if (arc.code !== 0) { console.error(`git archive 失败: ${arc.stderr.trim()}`); process.exit(2); }
+try {
+  await runAsync('tar', ['-xf', tarball, '-C', outDir]);
+} catch (error) {
+  console.error(`解包失败（需要 tar）: ${(error.stderr || error.message || '').trim()}`);
+  process.exit(2);
+}
 rmSync(tarball, { force: true });
 console.log(`上游 ${ref} 已导出到 ${outDir}`);
 
-const installOurs = (rel) => {
-  const from = path.join(root, rel);
-  if (!existsSync(from)) return false;
-  const to = path.join(outDir, rel);
-  mkdirSync(path.dirname(to), { recursive: true });
-  copyFileSync(from, to);
-  return true;
-};
+// 2. everything of ours that upstream does not own: our modules, our tests, our build layer.
+//    Also the files we patched, so a `follow` file we edited but upstream did not keeps our edit.
+const wanted = new Set([...(manifest.owner || []), ...(manifest.patched || [])]);
+const tracked = (await git('ls-files', '-z')).split('\0').filter(Boolean);
+const ours = tracked.filter((f) => wanted.has(f) || inList(policy.keep, f));
+let copied = 0;
+let copyBytes = 0;
+const BATCH = 64;
+for (let i = 0; i < ours.length; i += BATCH) {
+  await Promise.all(ours.slice(i, i + BATCH).map(async (rel) => {
+    const from = path.join(root, rel);
+    if (!existsSync(from) || !statSync(from).isFile()) return;
+    const to = path.join(outDir, rel);
+    mkdirSync(path.dirname(to), { recursive: true });
+    copyFileSync(from, to);
+    copied += 1;
+    copyBytes += statSync(from).size;
+  }));
+}
+console.log(`铺上我方文件 ${copied} 个（${(copyBytes / 1048576).toFixed(1)} MB）`);
 
-const stats = { kept: 0, merged: [], conflicts: [], upstreamOnly: 0, missing: [] };
+const stats = { merged: [], conflicts: [], upstreamOnly: 0, missing: [] };
 
-// Only files upstream actually changed since the base are in scope; everything else is already right.
-const changed = gitOut('diff', '--name-only', BASE, ref).split('\n').filter(Boolean);
+// 3. three-way merge for what upstream changed inside `follow`.
+const changed = (await git('diff', '--name-only', BASE, ref)).split('\n').filter(Boolean);
 const tmp = mkdtempSync(path.join(os.tmpdir(), 'sp-sync-base-'));
 try {
   for (const rel of changed) {
     const kind = classify(rel);
-    if (kind === 'keep' || kind === 'ignore') {
-      // Both mean "our copy stays". Upstream-only files in an ignored path (a new upstream test, say)
-      // are simply left in place - deleting them would be a guess, and they cost nothing.
-      if (installOurs(rel)) stats.kept += 1;
-      else stats.upstreamOnly += 1;
-      continue;
-    }
+    if (kind === 'keep') continue; // our copy was just laid down and wins outright
+    if (kind === 'ignore') { if (!existsSync(path.join(root, rel))) stats.upstreamOnly += 1; continue; }
     const theirs = path.join(outDir, rel);
-    const ours = path.join(root, rel);
+    const oursFile = path.join(root, rel); // read from the working tree, not the export
     if (!existsSync(theirs)) { stats.upstreamOnly += 1; continue; }
-    if (!existsSync(ours)) { stats.missing.push(rel); continue; }
-    const blob = run('git', ['show', `${BASE}:${rel}`]);
-    if (blob.status !== 0) { stats.missing.push(`${rel}（基线无此文件，保留上游版本）`); continue; }
+    if (!existsSync(oursFile)) { continue; } // upstream-only file inside a followed path: keep theirs
+    const blob = await gitRaw('show', `${BASE}:${rel}`);
+    if (blob.code !== 0) { stats.missing.push(`${rel}（基线无此文件，保留上游版本）`); continue; }
     const baseFile = path.join(tmp, 'base');
     writeFileSync(baseFile, blob.stdout);
-    const result = run('git', ['merge-file', '-p', '--diff3',
+    const result = await gitRaw('merge-file', '-p', '--diff3',
       '-L', 'ours(selfhost)', '-L', `base(${BASE.slice(0, 8)})`, '-L', 'theirs(upstream)',
-      ours, baseFile, theirs]);
-    if (result.status > 0) {
+      oursFile, baseFile, theirs);
+    if (result.code > 0) {
       writeFileSync(theirs + '.conflict', result.stdout);
-      stats.conflicts.push({ path: rel, hunks: result.status });
-    } else if (result.status === 0) {
+      stats.conflicts.push({ path: rel, hunks: result.code });
+    } else if (result.code === 0) {
       writeFileSync(theirs, result.stdout);
       stats.merged.push(rel);
     } else {
-      stats.missing.push(`${rel}（merge-file 出错: ${result.stderr?.trim()}）`);
+      stats.missing.push(`${rel}（merge-file 出错: ${result.stderr.trim()}）`);
     }
   }
 } finally {
@@ -116,9 +147,8 @@ try {
 console.log('');
 console.log(`基线              ${BASE.slice(0, 8)}（上游 ${ref} 相对它改了 ${changed.length} 个文件）`);
 console.log(`follow 自动合并    ${stats.merged.length} 个`);
-console.log(`keep/ignore 保留   ${stats.kept} 个`);
+console.log(`follow 需人工      ${stats.conflicts.length} 个`);
 console.log(`上游独有（未覆盖） ${stats.upstreamOnly} 个`);
-console.log(`需人工冲突         ${stats.conflicts.length} 个`);
 for (const c of stats.conflicts) {
   console.log(`      ${c.path}  ${c.hunks} 处冲突  ->  ${path.join(outDir, c.path)}.conflict`);
 }
